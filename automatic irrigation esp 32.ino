@@ -20,7 +20,14 @@ const int CALIBRATION_DRY = 3500;
 const int CALIBRATION_WET = 1200;
 const int DRY_THRESHOLD = 3000;
 const int WET_THRESHOLD = 1500;
-const unsigned long CHECK_INTERVAL_MS = 60000;
+// Millisecond time constants for readability
+const unsigned long MILLIS_PER_SECOND = 1000UL;
+const unsigned long MILLIS_PER_MINUTE = 60UL * MILLIS_PER_SECOND;
+const unsigned long MILLIS_PER_HOUR = 60UL * MILLIS_PER_MINUTE;
+const unsigned long MILLIS_PER_DAY = 24UL * MILLIS_PER_HOUR;
+const unsigned long MILLIS_PER_30_DAYS = 30UL * MILLIS_PER_DAY;
+
+const unsigned long CHECK_INTERVAL_MS = MILLIS_PER_MINUTE;
 const unsigned long MIN_PUMP_ON_TIME_MS = 300000;
 // --- FIX 3: Corrected typo ---
 const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 14400000; // (4 hours)
@@ -112,13 +119,13 @@ void loop() {
   }
   
   // 24-hour automatic daily report
-  if (millis() - dailyCheckTime >= 86400000) { // 24 hours
+  if (millis() - dailyCheckTime >= MILLIS_PER_DAY) { // 24 hours
     logMoistureAndMetricsReport();
     resetDailyMetrics();
   }
 
   // 30-Day automatic monthly report
-  if (millis() - monthlyCheckTime >= 2592000000) { // 30 days
+  if (millis() - monthlyCheckTime >= MILLIS_PER_30_DAYS) { // 30 days
     logMonthlyReport();
     resetMonthlyMetrics();
   }
@@ -356,6 +363,13 @@ bool checkIfAllSensorsWet() {
  * @brief Reads a single sensor from Mux, checking for simulation first.
  */
 int readSensor(int channel) {
+  
+  if (channel < 0 || channel >= NUM_SENSORS) { // NUM_SENSORS is 8
+    Serial.print("ERROR: Invalid channel request: ");
+    Serial.println(channel);
+    return CALIBRATION_DRY; // Return "dry" reading as safe fallback
+  }
+
   if (simulatedValues[channel] != -1) {
     int simValue = simulatedValues[channel];
     simulatedValues[channel] = -1; // Use simulation value only once
