@@ -28,9 +28,10 @@ const unsigned long MILLIS_PER_DAY = 24UL * MILLIS_PER_HOUR;
 const unsigned long MILLIS_PER_30_DAYS = 30UL * MILLIS_PER_DAY;
 
 const unsigned long CHECK_INTERVAL_MS = MILLIS_PER_MINUTE;
-const unsigned long MIN_PUMP_ON_TIME_MS = 300000;
+const unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE; // (5 minutes)
 // --- FIX 3: Corrected typo ---
-const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 14400000; // (4 hours)
+const unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR; // (e.g., 1 hour)
+const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR; // (4 hours)
 const int MIN_DRY_SENSORS_TO_TRIGGER = 3;
 const int NEIGHBOR_DISTANCE_THRESHOLD = 15;
 const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = 225;
@@ -39,7 +40,7 @@ const int PUMP_OFF = LOW;
 const float PUMP_FLOW_RATE_LITERS_PER_MINUTE = 20.0;
 
 // --- 3. CUSTOM TYPES (struct, enum) ---
-enum SystemState { MONITORING, IRRIGATING, WAITING };
+enum SystemState { MONITORING, IRRIGATING, WAITING, SYSTEM_FAULT };
 
 struct SensorNode {
   int x, y, channel;
@@ -113,9 +114,10 @@ void loop() {
   checkSerialCommands();
 
   switch (currentState) {
-    case MONITORING: handleMonitoring(); break;
-    case IRRIGATING: handleIrrigating(); break;
-    case WAITING:    handleWaiting();    break;
+    case MONITORING: handleMonitoring();    break;
+    case IRRIGATING: handleIrrigating();    break;
+    case WAITING:    handleWaiting();       break;
+    case SYSTEM_FAULT: handleSystemFault(); break;
   }
   
   // 24-hour automatic daily report
@@ -190,6 +192,13 @@ void checkSerialCommands() {
       Serial.println("SIM: Generating on-demand MONTHLY report...");
       logMonthlyReport();
     }
+    // --- NEW: Command to reset/clear a fault ---
+    else if (input == "FORCE_RESET") {
+      Serial.println("SIM: Fault cleared, returning to MONITORING.");
+      digitalWrite(RELAY_PIN, PUMP_OFF); // Ensure pump is off
+      currentState = MONITORING;
+      lastCheckTime = millis();
+    }
     // 4. Check for Timer Skip commands
     else if (input == "FORCE_CHECK") { lastCheckTime = 0; Serial.println("SIM: Forcing next MONITORING check."); }
     else if (input == "FORCE_IRRIGATE_CHECK") { pumpStartTime = 0; Serial.println("SIM: Forcing next IRRIGATING check."); }
@@ -227,16 +236,27 @@ void handleMonitoring() {
  * @brief State 2: Runs pump, checks if field is wet.
  */
 void handleIrrigating() {
+  if (millis() - pumpStartTime >= MAX_PUMP_ON_TIME_MS) {
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    Serial.println("!!! ALERT: IRRIGATION FAILURE (PUMP_ON_MAX) !!!");
+    Serial.println("Pump has run for max time but field is not wet.");
+    Serial.println("Shutting down system. Check pump/well.");
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    
+    digitalWrite(RELAY_PIN, PUMP_OFF);
+    currentState = SYSTEM_FAULT; // Enter the dead fault state
+    return; // Stop all further irrigation logic
+  }
   if (millis() - pumpStartTime < MIN_PUMP_ON_TIME_MS) {
-    if (millis() - lastCheckTime >= 10000) {
+    if (millis() - lastCheckTime >= 10 * MILLIS_PER_SECOND) {
         lastCheckTime = millis();
         Serial.print("Irrigating... (Min run time remaining: ");
-        Serial.print((MIN_PUMP_ON_TIME_MS - (millis() - pumpStartTime)) / 1000);
+        Serial.print((MIN_PUMP_ON_TIME_MS - (millis() - pumpStartTime)) / MILLIS_PER_SECOND);
         Serial.println(" sec)");
     }
     return;
   }
-  if (millis() - lastCheckTime >= 10000) {
+  if (millis() - lastCheckTime >= 10 * MILLIS_PER_SECOND) {
     lastCheckTime = millis();
     Serial.println("Min pump time complete. Checking if field is wet...");
     readAllSensors();
@@ -293,6 +313,16 @@ void handleWaiting() {
       Serial.print((POST_IRRIGATION_WAIT_TIME_MS - (millis() - wateringStopTime)) / 60000);
       Serial.println(" min)");
     }
+  }
+}
+
+void handleSystemFault() {
+  // We do nothing. The system is halted.
+  // We'll just print an alert every 5 seconds.
+  if (millis() - lastCheckTime >= 5 * MILLIS_PER_SECOND) {
+    lastCheckTime = millis();
+    digitalWrite(RELAY_PIN, PUMP_OFF);
+    Serial.println("!!! SYSTEM IN FAULT STATE - MANUAL RESET OR 'FORCE_RESET' REQUIRED !!!");
   }
 }
 
