@@ -20,6 +20,7 @@ const int CALIBRATION_DRY = 3500;
 const int CALIBRATION_WET = 1200;
 const int DRY_THRESHOLD = 3000;
 const int WET_THRESHOLD = 1500;
+const int LEAK_THRESHOLD_PERCENT = 98; // % for "super wet" leak check
 // Millisecond time constants for readability
 const unsigned long MILLIS_PER_SECOND = 1000UL;
 const unsigned long MILLIS_PER_MINUTE = 60UL * MILLIS_PER_SECOND;
@@ -33,8 +34,8 @@ const unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE; // (5 minutes)
 const unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR; // (e.g., 1 hour)
 const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR; // (4 hours)
 const int MIN_DRY_SENSORS_TO_TRIGGER = 3;
-const int NEIGHBOR_DISTANCE_THRESHOLD = 15;
-const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = 225;
+const int NEIGHBOR_DISTANCE_THRESHOLD = 12;
+const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = 144;
 const int PUMP_ON = HIGH;
 const int PUMP_OFF = LOW;
 const float PUMP_FLOW_RATE_LITERS_PER_MINUTE = 20.0;
@@ -214,6 +215,22 @@ void handleMonitoring() {
     lastCheckTime = millis();
     Serial.println("--- (Monitoring) ---");
     readAllSensors(); 
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      if (sensorMap[i].moisturePercentage >= LEAK_THRESHOLD_PERCENT) {
+        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        Serial.println("!!! WARNING: POTENTIAL LEAK DETECTED !!!");
+        Serial.print("Sensor (Ch ");
+        Serial.print(sensorMap[i].channel);
+        Serial.print(" @ ");
+        Serial.print(sensorMap[i].x);
+        Serial.print(",");
+        Serial.print(sensorMap[i].y);
+        Serial.print(") is ");
+        Serial.print(sensorMap[i].moisturePercentage);
+        Serial.println("% wet while pump is OFF.");
+        Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      }
+    }
     if (checkForCluster()) {
       Serial.println("Dry cluster found!");
       Serial.println("State change: MONITORING -> IRRIGATING");
@@ -373,22 +390,43 @@ void readAllSensors() {
  * (This logic is correct)
  */
 bool checkIfAllSensorsWet() {
+  int stillDryCount = 0;
+  int lastDrySensorChannel = -1;
+  int lastDrySensorX = -1, lastDrySensorY = -1;
+
   for (int i = 0; i < NUM_SENSORS; i++) {
-    // If a sensor is "drier" (value >) than the threshold, we are not all wet
+    // If a sensor is "drier" (value >) than the threshold...
     if (sensorMap[i].moistureValue > WET_THRESHOLD) {
-      Serial.print("...Sensor (Ch ");
-      Serial.print(sensorMap[i].channel);
-      Serial.print(") is still too dry (Val: ");
-      Serial.print(sensorMap[i].moistureValue);
-      Serial.print(" | ");
-      Serial.print(sensorMap[i].moisturePercentage);
-      Serial.println("%)");
-      return false; 
+      // ...it's not wet.
+      stillDryCount++;
+      lastDrySensorChannel = sensorMap[i].channel; // Record this sensor
+      lastDrySensorX = sensorMap[i].x;
+      lastDrySensorY = sensorMap[i].y;
+      // (We no longer print the "still too dry" message here,
+      //  to avoid spamming the log if there's a clog)
     }
   }
-  return true; // All sensors are wet
-}
 
+  // --- Clog Detection Logic ---
+  if (stillDryCount == 1) {
+    // Only ONE sensor is dry while all others are wet. This is a clog.
+    Serial.print("!!! WARNING: POTENTIAL CLOG DETECTED !!! ");
+    Serial.print("Sensor (Ch ");
+    Serial.print(lastDrySensorChannel);
+    Serial.print(" @ ");
+    Serial.print(lastDrySensorX);
+    Serial.print(",");
+    Serial.print(lastDrySensorY);
+    Serial.println(") is still dry, but all other sensors are wet.");
+  }
+  // --- End of Clog Detection ---
+
+  if (stillDryCount == 0) {
+    return true; // ALL sensors are wet
+  } else {
+    return false; // One or more sensors are still dry
+  }
+}
 /**
  * @brief Reads a single sensor from Mux, checking for simulation first.
  */
