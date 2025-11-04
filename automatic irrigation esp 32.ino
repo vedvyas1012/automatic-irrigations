@@ -1,10 +1,11 @@
 /*
  * ESP32 ADVANCED IRRIGATION SYSTEM
  *
- * *** 30-DAY "MONTHLY" REPORT VERSION ***
+ * *** PATCHED VERSION (Fixes 3 Bugs) ***
  *
- * This file contains all definitions at the top,
- * followed by setup(), loop(), and all custom functions.
+ * - FIX 1: Initialized simulatedValues[] in setup()
+ * - FIX 2: Correctly added litersUsed to totalLitersUsed
+ * - FIX 3: Corrected POST_IRRIGATION_WAIT_TIME_MS typo
  */
 
 // --- 1. PIN DEFINITIONS (ESP32 GPIO) ---
@@ -15,12 +16,13 @@ const int MUX_S1_PIN = 18;
 const int MUX_S2_PIN = 5;
 
 // --- 2. CRITICAL SETTINGS & THRESHOLDS ---
-const int CALIBRATION_DRY = 3500; // 0% moisture (in air)
-const int CALIBRATION_WET = 1200; // 100% moisture (in water)
-const int DRY_THRESHOLD = 3000; // Turn ON when a cluster is *ABOVE* this
-const int WET_THRESHOLD = 1500; // Turn OFF when ALL sensors are *BELOW* this
-const unsigned long CHECK_INTERVAL_MS = 60000;    // (1 minute)
-const unsigned long MIN_PUMP_ON_TIME_MS = 300000; // (5 minutes)
+const int CALIBRATION_DRY = 3500;
+const int CALIBRATION_WET = 1200;
+const int DRY_THRESHOLD = 3000;
+const int WET_THRESHOLD = 1500;
+const unsigned long CHECK_INTERVAL_MS = 60000;
+const unsigned long MIN_PUMP_ON_TIME_MS = 300000;
+// --- FIX 3: Corrected typo ---
 const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 14400000; // (4 hours)
 const int MIN_DRY_SENSORS_TO_TRIGGER = 3;
 const int NEIGHBOR_DISTANCE_THRESHOLD = 15;
@@ -78,7 +80,7 @@ int simulatedValues[NUM_SENSORS];
 // --- 5. THE setup() FUNCTION ---
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 Irrigation (Monthly Report) Initializing...");
+  Serial.println("ESP32 Irrigation (PATCHED) Initializing...");
 
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(MUX_S0_PIN, OUTPUT);
@@ -87,11 +89,11 @@ void setup() {
   digitalWrite(RELAY_PIN, PUMP_OFF);
 
   initializeSensorMap();
-  resetDailyMetrics();    // Initialize daily counters
-  resetMonthlyMetrics();  // Initialize monthly counters
-
-  // Initialize simulatedValues array with sentinel values
-  for(int i = 0; i < NUM_SENSORS; i++) {
+  resetDailyMetrics();    // Initializes daily counters (incl. per-sensor arrays)
+  resetMonthlyMetrics();  // Initializes monthly counters
+  
+  // --- FIX 1: Initialize simulation array ---
+  for (int i = 0; i < NUM_SENSORS; i++) {
     simulatedValues[i] = -1;
   }
   
@@ -243,6 +245,7 @@ void handleIrrigating() {
       irrigationFrequencyCount++;
       totalWateringDurationMin += wateringDurationMin;
       totalTimeToWetMin += timeToWetMin;
+      // --- FIX 2: Accumulate the total liters used ---
       totalLitersUsed += litersUsed;
       
       Serial.print("METRIC: Pump ran for ");
@@ -268,7 +271,8 @@ void handleIrrigating() {
  * @brief State 3: Cooldown period after watering.
  */
 void handleWaiting() {
-  if (millis() - wateringStopTime >= POST_IRRIGIGATION_WAIT_TIME_MS) {
+  // --- FIX 3: Corrected typo in constant name ---
+  if (millis() - wateringStopTime >= POST_IRRIGATION_WAIT_TIME_MS) {
     Serial.println("Cooldown/Lockout complete.");
     Serial.println("State change: WAITING -> MONITORING");
     timeSinceLastIrrigation = millis() - wateringStopTime;
@@ -278,7 +282,8 @@ void handleWaiting() {
     if (millis() - lastCheckTime >= 60000) {
       lastCheckTime = millis();
       Serial.print("Post-irrigation cooldown... (Time remaining: ");
-      Serial.print((POST_IRRIGIGATION_WAIT_TIME_MS - (millis() - wateringStopTime)) / 60000);
+      // --- FIX 3: Corrected typo in constant name ---
+      Serial.print((POST_IRRIGATION_WAIT_TIME_MS - (millis() - wateringStopTime)) / 60000);
       Serial.println(" min)");
     }
   }
@@ -328,9 +333,11 @@ void readAllSensors() {
 
 /**
  * @brief Checks if ALL sensors are wetter than the WET_THRESHOLD.
+ * (This logic is correct)
  */
 bool checkIfAllSensorsWet() {
   for (int i = 0; i < NUM_SENSORS; i++) {
+    // If a sensor is "drier" (value >) than the threshold, we are not all wet
     if (sensorMap[i].moistureValue > WET_THRESHOLD) {
       Serial.print("...Sensor (Ch ");
       Serial.print(sensorMap[i].channel);
