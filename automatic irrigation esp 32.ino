@@ -21,7 +21,7 @@ const int DRY_THRESHOLD = 3000; // Turn ON when a cluster is *ABOVE* this
 const int WET_THRESHOLD = 1500; // Turn OFF when ALL sensors are *BELOW* this
 const unsigned long CHECK_INTERVAL_MS = 60000;    // (1 minute)
 const unsigned long MIN_PUMP_ON_TIME_MS = 300000; // (5 minutes)
-const unsigned long POST_IRRIGIGATION_WAIT_TIME_MS = 14400000; // (4 hours)
+const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 14400000; // (4 hours)
 const int MIN_DRY_SENSORS_TO_TRIGGER = 3;
 const int NEIGHBOR_DISTANCE_THRESHOLD = 15;
 const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = 225;
@@ -89,6 +89,11 @@ void setup() {
   initializeSensorMap();
   resetDailyMetrics();    // Initialize daily counters
   resetMonthlyMetrics();  // Initialize monthly counters
+
+  // Initialize simulatedValues array with sentinel values
+  for(int i = 0; i < NUM_SENSORS; i++) {
+    simulatedValues[i] = -1;
+  }
   
   lastCheckTime = millis();
   wateringStopTime = millis();
