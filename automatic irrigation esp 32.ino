@@ -1,53 +1,36 @@
 /*
  * ESP32 ADVANCED IRRIGATION SYSTEM
  *
- * *** UPDATED: Full Phase 2 Metrics & Logging ***
+ * *** 30-DAY "MONTHLY" REPORT VERSION ***
  *
- * - ADDED: All variables & logic for Phase 2 (Steps 2, 3, 4).
- * - ADDED: PUMP_FLOW_RATE_LITERS_PER_MINUTE constant.
- * - MODIFIED: State change logic to immediately log new metrics.
- * - MODIFIED: logDailyReport() to show a full summary of all metrics.
+ * This file contains all definitions at the top,
+ * followed by setup(), loop(), and all custom functions.
  */
 
-// --- 1. PIN DEFINITIONS ---
+// --- 1. PIN DEFINITIONS (ESP32 GPIO) ---
 const int RELAY_PIN = 23;
 const int MUX_COMMON_PIN = 34;
 const int MUX_S0_PIN = 19;
 const int MUX_S1_PIN = 18;
 const int MUX_S2_PIN = 5;
 
-// --- 2. CRITICAL SETTINGS ---
-
-// --- SENSOR CALIBRATION (0-4095) ---
+// --- 2. CRITICAL SETTINGS & THRESHOLDS ---
 const int CALIBRATION_DRY = 3500; // 0% moisture (in air)
 const int CALIBRATION_WET = 1200; // 100% moisture (in water)
-
-// --- THRESHOLDS ---
-const int DRY_THRESHOLD = 3000; // (e.g., 14%)
-const int WET_THRESHOLD = 1500; // (e.g., 87%)
-
-// --- TIMING (in milliseconds: 60000 = 1 min) ---
+const int DRY_THRESHOLD = 3000; // Turn ON when a cluster is *ABOVE* this
+const int WET_THRESHOLD = 1500; // Turn OFF when ALL sensors are *BELOW* this
 const unsigned long CHECK_INTERVAL_MS = 60000;    // (1 minute)
 const unsigned long MIN_PUMP_ON_TIME_MS = 300000; // (5 minutes)
-const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 14400000; // (4 hours)
-
-// --- ALGORITHM LOGIC ---
+const unsigned long POST_IRRIGIGATION_WAIT_TIME_MS = 14400000; // (4 hours)
 const int MIN_DRY_SENSORS_TO_TRIGGER = 3;
 const int NEIGHBOR_DISTANCE_THRESHOLD = 15;
 const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = 225;
 const int PUMP_ON = HIGH;
 const int PUMP_OFF = LOW;
+const float PUMP_FLOW_RATE_LITERS_PER_MINUTE = 20.0;
 
-// --- NEW (PHASE 2, STEP 4): PUMP FLOW RATE ---
-// (Set this to your pump's flow rate in Liters/min)
-const float PUMP_FLOW_RATE_LITERS_PER_MINUTE = 40.0;
-
-// --- 3. SYSTEM STATE & SENSOR MAP ---
+// --- 3. CUSTOM TYPES (struct, enum) ---
 enum SystemState { MONITORING, IRRIGATING, WAITING };
-SystemState currentState = MONITORING;
-unsigned long lastCheckTime = 0;
-unsigned long pumpStartTime = 0;
-unsigned long wateringStopTime = 0;
 
 struct SensorNode {
   int x, y, channel;
@@ -55,35 +38,47 @@ struct SensorNode {
   int moistureValue;
   int moisturePercentage;
 };
+
+// --- 4. GLOBAL VARIABLES ---
+SystemState currentState = MONITORING;
 const int NUM_SENSORS = 8;
 SensorNode sensorMap[NUM_SENSORS];
 
-// --- 4. PHASE 2 METRIC VARIABLES ---
-unsigned long timeToWet = 0;
-unsigned long timeToDry = 0;
-unsigned long wateringDuration = 0;
-unsigned long timeSinceLastIrrigation = 0;
-unsigned long dailyCheckTime = 0;
+// State Timers
+unsigned long lastCheckTime = 0;
+unsigned long pumpStartTime = 0;
+unsigned long wateringStopTime = 0;
 
-// --- NEW: Variables for Daily Report ---
+// Daily Metric Variables
+unsigned long timeToWet = 0, timeToDry = 0, wateringDuration = 0, timeSinceLastIrrigation = 0;
+unsigned long dailyCheckTime = 0;
 int irrigationFrequencyCount = 0;
-long totalMoistureReadings = 0;
-long totalMoistureSum = 0;
 float totalWateringDurationMin = 0;
 float totalLitersUsed = 0;
 float totalTimeToWetMin = 0;
 float totalTimeToDryHours = 0;
+long totalMoistureSumPerSensor[NUM_SENSORS];
+long totalMoistureReadingsPerSensor[NUM_SENSORS];
+long totalFieldMoistureSum = 0;
+long totalFieldMoistureReadings = 0;
 
+// Monthly Metric Variables
+unsigned long monthlyCheckTime = 0;
+int monthlyIrrigationFrequency = 0;
+float monthlyTotalLitersUsed = 0;
+float monthlyTotalWateringMin = 0;
+float monthlyAvgTimeToWet = 0;
+float monthlyAvgTimeToDry = 0;
+float monthlyAvgFieldMoisture = 0;
+int monthlyReportCount = 0;
 
-// --- 5. SIMULATION ---
+// Simulation Variable
 int simulatedValues[NUM_SENSORS];
-// --- END OF SETTINGS ---
 
-
+// --- 5. THE setup() FUNCTION ---
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 Irrigation (Phase 2 Metrics) Initializing...");
-  Serial.println("Ready for simulation commands.");
+  Serial.println("ESP32 Irrigation (Monthly Report) Initializing...");
 
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(MUX_S0_PIN, OUTPUT);
@@ -92,46 +87,49 @@ void setup() {
   digitalWrite(RELAY_PIN, PUMP_OFF);
 
   initializeSensorMap();
-
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    simulatedValues[i] = -1;
-  }
+  resetDailyMetrics();    // Initialize daily counters
+  resetMonthlyMetrics();  // Initialize monthly counters
   
   lastCheckTime = millis();
-  dailyCheckTime = millis();
-  wateringStopTime = millis(); // Initialize to now
+  wateringStopTime = millis();
 }
 
+// --- 6. THE loop() FUNCTION ---
 void loop() {
   checkSerialCommands();
 
   switch (currentState) {
-    case MONITORING:
-      handleMonitoring();
-      break;
-    case IRRIGATING:
-      handleIrrigating();
-      break;
-    case WAITING:
-      handleWaiting();
-      break;
+    case MONITORING: handleMonitoring(); break;
+    case IRRIGATING: handleIrrigating(); break;
+    case WAITING:    handleWaiting();    break;
   }
   
+  // 24-hour automatic daily report
   if (millis() - dailyCheckTime >= 86400000) { // 24 hours
-    logDailyReport();
+    logMoistureAndMetricsReport();
     resetDailyMetrics();
+  }
+
+  // 30-Day automatic monthly report
+  if (millis() - monthlyCheckTime >= 2592000000) { // 30 days
+    logMonthlyReport();
+    resetMonthlyMetrics();
   }
 }
 
-// --- COMMAND & STATE FUNCTIONS ---
+// --- 7. ALL OTHER CUSTOM FUNCTIONS ---
 
+/**
+ * @brief Central handler for all serial commands.
+ */
 void checkSerialCommands() {
-  // ... (This function is unchanged)
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
     Serial.print("COMMAND RECEIVED: ");
     Serial.println(input);
+    
+    // 1. Check for Sensor Simulation (e.g., "S3:3500")
     if (input.startsWith("S")) {
       int colonIndex = input.indexOf(':');
       if (colonIndex > 0) {
@@ -146,6 +144,7 @@ void checkSerialCommands() {
         }
       }
     }
+    // 2. Check for State Force (e.g., "STATE:MONITORING")
     else if (input.startsWith("STATE:")) {
       String newState = input.substring(6);
       newState.toUpperCase();
@@ -156,42 +155,51 @@ void checkSerialCommands() {
       } else if (newState == "IRRIGATING") {
         currentState = IRRIGATING;
         pumpStartTime = millis();
-        timeToDry = millis() - wateringStopTime; // Log timeToDry
+        timeToDry = millis() - wateringStopTime;
         digitalWrite(RELAY_PIN, PUMP_ON);
         Serial.println("SIM: State FORCED to IRRIGATING.");
       } else if (newState == "WAITING") {
         currentState = WAITING;
         wateringStopTime = millis();
-        wateringDuration = millis() - pumpStartTime; // Log duration
-        timeToWet = millis() - pumpStartTime; // Log timeToWet
+        wateringDuration = millis() - pumpStartTime;
+        timeToWet = millis() - pumpStartTime;
         digitalWrite(RELAY_PIN, PUMP_OFF);
         Serial.println("SIM: State FORCED to WAITING.");
       }
     }
+    // 3. Check for Report commands
+    else if (input == "REPORT") {
+      Serial.println("SIM: Generating on-demand DAILY report...");
+      logMoistureAndMetricsReport();
+    }
+    else if (input == "MONTHLY_REPORT") {
+      Serial.println("SIM: Generating on-demand MONTHLY report...");
+      logMonthlyReport();
+    }
+    // 4. Check for Timer Skip commands
     else if (input == "FORCE_CHECK") { lastCheckTime = 0; Serial.println("SIM: Forcing next MONITORING check."); }
     else if (input == "FORCE_IRRIGATE_CHECK") { pumpStartTime = 0; Serial.println("SIM: Forcing next IRRIGATING check."); }
     else if (input == "FORCE_WAIT_SKIP") { wateringStopTime = 0; Serial.println("SIM: Forcing WAITING skip."); }
   }
 }
 
+/**
+ * @brief State 1: Checks sensors, looks for clusters.
+ */
 void handleMonitoring() {
   if (millis() - lastCheckTime >= CHECK_INTERVAL_MS) {
     lastCheckTime = millis();
     Serial.println("--- (Monitoring) ---");
     readAllSensors(); 
-    
     if (checkForCluster()) {
       Serial.println("Dry cluster found!");
       Serial.println("State change: MONITORING -> IRRIGATING");
-      
-      // --- LOG METRIC (Drying Rate) ---
       timeToDry = millis() - wateringStopTime;
-      float timeToDryHours = (float)timeToDry / 3600000.0; // ms to hours
+      float timeToDryHours = (float)timeToDry / 3600000.0;
       totalTimeToDryHours += timeToDryHours;
       Serial.print("METRIC: Field took ");
       Serial.print(timeToDryHours);
       Serial.println(" hours to dry.");
-      
       digitalWrite(RELAY_PIN, PUMP_ON);
       pumpStartTime = millis();
       currentState = IRRIGATING;
@@ -201,6 +209,9 @@ void handleMonitoring() {
   }
 }
 
+/**
+ * @brief State 2: Runs pump, checks if field is wet.
+ */
 void handleIrrigating() {
   if (millis() - pumpStartTime < MIN_PUMP_ON_TIME_MS) {
     if (millis() - lastCheckTime >= 10000) {
@@ -218,17 +229,12 @@ void handleIrrigating() {
     if (checkIfAllSensorsWet()) {
       Serial.println("Field is now fully wet.");
       Serial.println("State change: IRRIGATING -> WAITING");
-
-      // --- LOG METRICS (Wetting Rate & Duration) ---
       wateringDuration = millis() - pumpStartTime;
-      float wateringDurationMin = (float)wateringDuration / 60000.0; // ms to minutes
-      
-      timeToWet = wateringDuration; // timeToWet = pump duration
+      float wateringDurationMin = (float)wateringDuration / 60000.0;
+      timeToWet = wateringDuration;
       float timeToWetMin = wateringDurationMin;
-      
       float litersUsed = wateringDurationMin * PUMP_FLOW_RATE_LITERS_PER_MINUTE;
       
-      // Add to daily totals
       irrigationFrequencyCount++;
       totalWateringDurationMin += wateringDurationMin;
       totalTimeToWetMin += timeToWetMin;
@@ -253,31 +259,37 @@ void handleIrrigating() {
   }
 }
 
+/**
+ * @brief State 3: Cooldown period after watering.
+ */
 void handleWaiting() {
-  if (millis() - wateringStopTime >= POST_IRRIGATION_WAIT_TIME_MS) {
+  if (millis() - wateringStopTime >= POST_IRRIGIGATION_WAIT_TIME_MS) {
     Serial.println("Cooldown/Lockout complete.");
     Serial.println("State change: WAITING -> MONITORING");
     timeSinceLastIrrigation = millis() - wateringStopTime;
     lastCheckTime = millis();
     currentState = MONITORING;
   } else {
-    // ... (This function is unchanged)
     if (millis() - lastCheckTime >= 60000) {
       lastCheckTime = millis();
       Serial.print("Post-irrigation cooldown... (Time remaining: ");
-      Serial.print((POST_IRRIGATION_WAIT_TIME_MS - (millis() - wateringStopTime)) / 60000);
+      Serial.print((POST_IRRIGIGATION_WAIT_TIME_MS - (millis() - wateringStopTime)) / 60000);
       Serial.println(" min)");
     }
   }
 }
 
-// --- HELPER FUNCTIONS ---
-
+/**
+ * @brief Converts a raw 0-4095 ADC value to a 0-100% percentage.
+ */
 int convertToPercentage(int rawValue) {
   int percentage = map(rawValue, CALIBRATION_DRY, CALIBRATION_WET, 0, 100);
   return constrain(percentage, 0, 100);
 }
 
+/**
+ * @brief Reads all sensors and updates their data in the map.
+ */
 void readAllSensors() {
   for (int i = 0; i < NUM_SENSORS; i++) {
     int channel = sensorMap[i].channel;
@@ -285,13 +297,20 @@ void readAllSensors() {
     sensorMap[i].moistureValue = value;
     sensorMap[i].isDry = (value > DRY_THRESHOLD);
     sensorMap[i].moisturePercentage = convertToPercentage(value);
-
-    // --- Add to daily average totals ---
-    totalMoistureSum += sensorMap[i].moisturePercentage;
-    totalMoistureReadings++;
     
+    // Add to daily totals
+    totalMoistureSumPerSensor[i] += sensorMap[i].moisturePercentage;
+    totalMoistureReadingsPerSensor[i]++;
+    totalFieldMoistureSum += sensorMap[i].moisturePercentage;
+    totalFieldMoistureReadings++;
+    
+    // Print status
     Serial.print("  Sensor (Ch ");
     Serial.print(channel);
+    Serial.print(" @ ");
+    Serial.print(sensorMap[i].x);
+    Serial.print(",");
+    Serial.print(sensorMap[i].y);
     Serial.print("): ");
     Serial.print(value);
     Serial.print(" | ");
@@ -302,8 +321,10 @@ void readAllSensors() {
   }
 }
 
+/**
+ * @brief Checks if ALL sensors are wetter than the WET_THRESHOLD.
+ */
 bool checkIfAllSensorsWet() {
-  // ... (This function is unchanged)
   for (int i = 0; i < NUM_SENSORS; i++) {
     if (sensorMap[i].moistureValue > WET_THRESHOLD) {
       Serial.print("...Sensor (Ch ");
@@ -316,16 +337,26 @@ bool checkIfAllSensorsWet() {
       return false; 
     }
   }
-  return true;
+  return true; // All sensors are wet
 }
 
+/**
+ * @brief Reads a single sensor from Mux, checking for simulation first.
+ */
 int readSensor(int channel) {
-  // ... (This function is unchanged)
   if (simulatedValues[channel] != -1) {
     int simValue = simulatedValues[channel];
-    simulatedValues[channel] = -1; 
+    simulatedValues[channel] = -1; // Use simulation value only once
+    
+    Serial.print("...Using simulated value ");
+    Serial.print(simValue);
+    Serial.print(" for Sensor ");
+    Serial.println(channel);
+    
     return simValue;
   }
+  
+  // Read from hardware
   digitalWrite(MUX_S0_PIN, bitRead(channel, 0));
   digitalWrite(MUX_S1_PIN, bitRead(channel, 1));
   digitalWrite(MUX_S2_PIN, bitRead(channel, 2));
@@ -333,15 +364,19 @@ int readSensor(int channel) {
   return analogRead(MUX_COMMON_PIN);
 }
 
+/**
+ * @brief Checks if a "cluster" of dry sensors exists.
+ */
 bool checkForCluster() {
-  // ... (This function is unchanged)
   int dryCount = 0;
   for (int i = 0; i < NUM_SENSORS; i++) {
     if (sensorMap[i].isDry) dryCount++;
   }
   if (dryCount < MIN_DRY_SENSORS_TO_TRIGGER) {
-    return false;
+    return false; // Not enough dry sensors
   }
+  
+  // Check for neighbors
   for (int i = 0; i < NUM_SENSORS; i++) {
     if (sensorMap[i].isDry) {
       for (int j = i + 1; j < NUM_SENSORS; j++) {
@@ -350,41 +385,64 @@ bool checkForCluster() {
           long dy = sensorMap[i].y - sensorMap[j].y;
           long distanceSquared = (dx * dx) + (dy * dy);
           if (distanceSquared <= NEIGHBOR_DISTANCE_THRESHOLD_SQUARED) {
-            return true;
+            return true; // Found a cluster
           }
         }
       }
     }
   }
-  return false;
+  return false; // Found dry sensors, but they were all isolated
 }
 
 /**
- * @brief NEW: Prints a full daily report of all logged metrics.
+ * @brief Prints a full daily report AND adds totals to the monthly counters.
  */
-void logDailyReport() {
+void logMoistureAndMetricsReport() {
   Serial.println("=========================================");
   Serial.println("--- 24-HOUR DAILY REPORT ---");
   Serial.println("=========================================");
-  
+
+  // 1. Per-Sensor Moisture Report
+  Serial.println("--- Per-Sensor Daily Averages ---");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    float avgMoisture = 0.0;
+    if (totalMoistureReadingsPerSensor[i] > 0) {
+      avgMoisture = (float)totalMoistureSumPerSensor[i] / (float)totalMoistureReadingsPerSensor[i];
+    }
+    Serial.print("Sensor (Ch ");
+    Serial.print(sensorMap[i].channel);
+    Serial.print(" @ ");
+    Serial.print(sensorMap[i].x);
+    Serial.print(",");
+    Serial.print(sensorMap[i].y);
+    Serial.print("): ");
+    Serial.print(avgMoisture);
+    Serial.println("% avg");
+  }
+
+  // 2. Irrigation Metrics
+  Serial.println("--- Irrigation Metrics (Totals & Avgs) ---");
   Serial.print("Irrigation Cycles Today: ");
   Serial.println(irrigationFrequencyCount);
 
-  // Calculate averages
-  float avgMoisture = (float)totalMoistureSum / (float)totalMoistureReadings;
-  float avgWateringDuration = totalWateringDurationMin / (float)irrigationFrequencyCount;
-  float avgTimeToWet = totalTimeToWetMin / (float)irrigationFrequencyCount;
-  float avgTimeToDry = totalTimeToDryHours / (float)irrigationFrequencyCount;
-
-  // Prevent divide-by-zero if no irrigation occurred
-  if (irrigationFrequencyCount == 0) {
-    avgWateringDuration = 0;
-    avgTimeToWet = 0;
-    avgTimeToDry = 0;
+  // Calculate field averages
+  float avgFieldMoisture = 0.0;
+  if(totalFieldMoistureReadings > 0) {
+    avgFieldMoisture = (float)totalFieldMoistureSum / (float)totalFieldMoistureReadings;
+  }
+  
+  float avgWateringDuration = 0.0;
+  float avgTimeToWet = 0.0;
+  float avgTimeToDry = 0.0;
+  
+  if (irrigationFrequencyCount > 0) {
+    avgWateringDuration = totalWateringDurationMin / (float)irrigationFrequencyCount;
+    avgTimeToWet = totalTimeToWetMin / (float)irrigationFrequencyCount;
+    avgTimeToDry = totalTimeToDryHours / (float)irrigationFrequencyCount;
   }
 
-  Serial.print("Average Field Moisture: ");
-  Serial.print(avgMoisture);
+  Serial.print("Avg. Field Moisture: ");
+  Serial.print(avgFieldMoisture);
   Serial.println("%");
   
   Serial.print("Total Water Used (Est.): ");
@@ -404,24 +462,100 @@ void logDailyReport() {
   Serial.println(" hours");
   
   Serial.println("=========================================");
+  
+  // 3. Add daily totals to monthly totals
+  monthlyIrrigationFrequency += irrigationFrequencyCount;
+  monthlyTotalLitersUsed += totalLitersUsed;
+  monthlyTotalWateringMin += totalWateringDurationMin;
+  monthlyAvgTimeToWet += avgTimeToWet;
+  monthlyAvgTimeToDry += avgTimeToDry;
+  monthlyAvgFieldMoisture += avgFieldMoisture;
+  monthlyReportCount++; // Increment count of daily reports
 }
 
 /**
- * @brief NEW: Resets all daily counters.
+ * @brief Prints a full 30-Day "Monthly" Report
+ */
+void logMonthlyReport() {
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  Serial.println("--- 30-DAY MONTHLY REPORT ---");
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+
+  Serial.print("Total Irrigation Cycles: ");
+  Serial.println(monthlyIrrigationFrequency);
+  
+  Serial.print("Total Water Used (Est.): ");
+  Serial.print(monthlyTotalLitersUsed);
+  Serial.println(" Liters");
+
+  Serial.print("Total Pump Run Time: ");
+  Serial.print(monthlyTotalWateringMin);
+  Serial.println(" minutes");
+
+  Serial.println("--- Monthly Averages (Avg. of Dailies) ---");
+
+  float finalAvgFieldMoisture = 0;
+  float finalAvgTimeToWet = 0;
+  float finalAvgTimeToDry = 0;
+
+  if (monthlyReportCount > 0) {
+    finalAvgFieldMoisture = monthlyAvgFieldMoisture / (float)monthlyReportCount;
+    finalAvgTimeToWet = monthlyAvgTimeToWet / (float)monthlyReportCount;
+    finalAvgTimeToDry = monthlyAvgTimeToDry / (float)monthlyReportCount;
+  }
+
+  Serial.print("Avg. Field Moisture: ");
+  Serial.print(finalAvgFieldMoisture);
+  Serial.println("%");
+
+  Serial.print("Avg. Time to Wet: ");
+  Serial.print(finalAvgTimeToWet);
+  Serial.println(" minutes");
+
+  Serial.print("Avg. Time to Dry: ");
+  Serial.print(finalAvgTimeToDry);
+  Serial.println(" hours");
+  
+  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+}
+
+/**
+ * @brief Resets all daily counters.
  */
 void resetDailyMetrics() {
   irrigationFrequencyCount = 0;
-  totalMoistureSum = 0;
-  totalMoistureReadings = 0;
   totalWateringDurationMin = 0;
   totalLitersUsed = 0;
   totalTimeToWetMin = 0;
   totalTimeToDryHours = 0;
+  totalFieldMoistureSum = 0;
+  totalFieldMoistureReadings = 0;
   dailyCheckTime = millis(); // Reset 24h timer
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    totalMoistureSumPerSensor[i] = 0;
+    totalMoistureReadingsPerSensor[i] = 0;
+  }
 }
 
+/**
+ * @brief Resets all monthly counters.
+ */
+void resetMonthlyMetrics() {
+  monthlyIrrigationFrequency = 0;
+  monthlyTotalLitersUsed = 0;
+  monthlyTotalWateringMin = 0;
+  monthlyAvgTimeToWet = 0;
+  monthlyAvgTimeToDry = 0;
+  monthlyAvgFieldMoisture = 0;
+  monthlyReportCount = 0;
+  monthlyCheckTime = millis(); // Reset 30-day timer
+}
+
+/**
+ * @brief Initializes the sensor (X,Y) map.
+ */
 void initializeSensorMap() {
-  // ... (This function is unchanged)
   sensorMap[0] = {10, 10, 1, false, 0, 0}; 
   sensorMap[1] = {10, 20, 2, false, 0, 0}; 
   sensorMap[2] = {10, 30, 3, false, 0, 0};
