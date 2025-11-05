@@ -1,12 +1,47 @@
 /*
+ * ==========================================================
  * ESP32 ADVANCED IRRIGATION SYSTEM
+ * FINAL REFACTORED CODE (as of 2025-11-06)
  *
- * *** PATCHED VERSION (Fixes 3 Bugs) ***
+ * This version includes all "Easy Polish" fixes from the
+ * final code review (Phase 3 complete).
  *
- * - FIX 1: Initialized simulatedValues[] in setup()
- * - FIX 2: Correctly added litersUsed to totalLitersUsed
- * - FIX 3: Corrected POST_IRRIGATION_WAIT_TIME_MS typo
+ * - FIX 1 (LOGIC): Replaced checkForCluster() with advanced BFS algorithm.
+ * - FIX 2 (LOGIC): Removed duplicate printing from readAllSensors().
+ * - FIX 3 (ROBUST): Added 5-sample moving average to readSensor() for de-noising.
+ * - FIX 4 (LOGIC): Fixed "Unexpectedly Dry" alert contradiction.
+ * - FIX 5 (LOGIC): Reset moisture-failure trackers on success/reset.
+ * - FIX 6 (BUG): Restored "S:" simulation command logic.
+ * - FIX 7 (BUG): Restored "Leak Detection" print logic.
+ * - FIX 8 (BUG): Corrected "FORCE_IRRIGATE_CHECK" to use irrTick.
+ * - FIX 9 (BUG): Corrected "dailyIndex" persistence timing.
+ * - FIX 10 (BUG): Removed stray compile-error tokens from logMonthlyReport().
+ * - FIX 11 (BUG): Reordered "STATE:" and "S:" commands to prevent collision.
+ * - FIX 12 (BUG): Corrected signed/unsigned math for "time remaining" logs.
+ * - ADDED 1 (ROBUST): Added ADC Attenuation in setup().
+ * - ADDED 2 (TELEMETRY): Added <Preferences.h> to save/load monthly totals.
+ * - ADDED 3 (TELEMETRY): Added logCsvDailySummary() with an incrementing dailyIndex.
+ * - ADDED 4 (SAFETY): Added "TEST_PUMP_30S" serial command.
+ * - ADDED 5 (SAFETY): Added runPowerOnSelfTest() to setup().
+ * - ADDED 6 (CLARITY): Added isFieldWet() helper function.
+ * - ADDED 7 (LOGIC): Added "latch" to de-spam "Unexpectedly Dry" alert.
+ * - ADDED 8 (ROBUST): Replaced single lastCheckTime with per-state timers.
+ * - ADDED 9 (ROBUST): Replaced prefs.clear() with explicit resets.
+ * - ADDED 10 (ROBUST): Clamped "time remaining" logs to prevent negatives.
+ * - ADDED 11 (POLISH): Added static_asserts for key constants.
+ * - ADDED 12 (POLISH): Made ADC sample count a constant and tuned delays.
+ * - ADDED 13 (POLISH): Added CSV_HEADER log on boot.
+ * - ADDED 14 (POLISH): Added cluster size logging.
+ * - ADDED 15 (POLISH): Added safety comment for FORCE_WAIT_SKIP.
+ * - ADDED 16 (POLISH): Added (long) casts to map() function.
+ * - ADDED 17 (POLISH): Derived squared threshold from base threshold.
+ * - ADDED 18 (POLISH): Updated ADC sample comment.
+ * - ADDED 19 (POLISH-LATEST): Created forcePumpOff() to remove duplicate code.
+ * - ADDED 20 (POLISH-LATEST): Replaced magic numbers for check intervals.
  */
+
+// --- 0. INCLUDES ---
+#include <Preferences.h> // For saving data to flash
 
 // --- 1. PIN DEFINITIONS (ESP32 GPIO) ---
 const int RELAY_PIN = 23;
@@ -15,35 +50,47 @@ const int MUX_S0_PIN = 19;
 const int MUX_S1_PIN = 18;
 const int MUX_S2_PIN = 5;
 
-// --- 2. CRITICAL SETTINGS & THRESHOLDS ---
-const int CALIBRATION_DRY = 3500;
-const int CALIBRATION_WET = 1200;
-const int DRY_THRESHOLD = 3000;
-const int WET_THRESHOLD = 1500;
-const int LEAK_THRESHOLD_PERCENT = 98; // % for "super wet" leak check
-// Millisecond time constants for readability
+// --- Time conversion constants ---
 const unsigned long MILLIS_PER_SECOND = 1000UL;
-const unsigned long MILLIS_PER_MINUTE = 60UL * MILLIS_PER_SECOND;
-const unsigned long MILLIS_PER_HOUR = 60UL * MILLIS_PER_MINUTE;
-const unsigned long MILLIS_PER_DAY = 24UL * MILLIS_PER_HOUR;
-const unsigned long MILLIS_PER_30_DAYS = 30UL * MILLIS_PER_DAY;
+const unsigned long MILLIS_PER_MINUTE = 60000UL;
+const unsigned long MILLIS_PER_HOUR   = 3600000UL;
+const unsigned long MILLIS_PER_DAY    = 86400000UL;
+const unsigned long MILLIS_PER_30_DAYS = 2592000000UL;
 
-const unsigned long CHECK_INTERVAL_MS = MILLIS_PER_MINUTE;
-const unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE; // (5 minutes)
-// --- FIX 3: Corrected typo ---
-const unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR; // (e.g., 1 hour)
-const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR; // (4 hours)
-// --- NEW: Phase 3 Alert & Report Thresholds ---
-// How long can soil stay dry before it's "unexpected"? (e.g., 7 days)
+// --- 2. CRITICAL SETTINGS & THRESHOLDS ---
+const int CALIBRATION_DRY = 3500; // 0% moisture (in air)
+const int CALIBRATION_WET = 1200; // 100% moisture (in water)
+const int DRY_THRESHOLD = 3000; // Turn ON when a cluster is *ABOVE* this
+const int WET_THRESHOLD = 1500; // Turn OFF when ALL sensors are *BELOW* this
+const int LEAK_THRESHOLD_PERCENT = 98; // % for "super wet" leak check
+const int ADC_SAMPLES = 5; // Number of ADC samples for de-noising
+const int MUX_SETTLE_TIME_US = 800; // (microseconds)
+const int ADC_SAMPLE_DELAY_MS = 1; // (milliseconds)
+
+// --- Compile-time safety checks ---
+static_assert(WET_THRESHOLD < DRY_THRESHOLD, "WET_THRESHOLD must be less than DRY_THRESHOLD");
+static_assert(ADC_SAMPLES > 0, "ADC_SAMPLES must be at least 1");
+
+// --- TIMING ---
+const unsigned long CHECK_INTERVAL_MS = 1 * MILLIS_PER_MINUTE;
+const unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE;
+const unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR;
+const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR;
+// --- NEW: Check interval constants ---
+const unsigned long IRRIGATING_CHECK_INTERVAL_MS = 10 * MILLIS_PER_SECOND;
+const unsigned long FAULT_PRINT_INTERVAL_MS = 5 * MILLIS_PER_SECOND;
+
+// --- ALERTS & REPORTING ---
 const unsigned long MAX_TIME_UNEXPECTEDLY_DRY_MS = 7 * MILLIS_PER_DAY;
-// How long can soil stay wet before it's "unexpected"? (e.g., 3 days)
 const unsigned long MAX_TIME_UNEXPECTEDLY_WET_MS = 3 * MILLIS_PER_DAY;
-// "Healthy" soil report card values (you will need to tune these)
-const float HEALTHY_WETTING_TIME_MIN = 10.0; // (e.g., < 10 min = good infiltration)
-const float HEALTHY_DRYING_TIME_HOURS = 48.0; // (e.g., > 48 hours = poor drainage)
-const int MIN_DRY_SENSORS_TO_TRIGGER = 3;
-const int NEIGHBOR_DISTANCE_THRESHOLD = 12;
-const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = 144;
+const float HEALTHY_WETTING_TIME_MIN = 10.0;
+const float HEALTHY_DRYING_TIME_HOURS = 48.0;
+
+// --- ALGORITHM LOGIC ---
+const int MIN_DRY_SENSORS_TO_TRIGGER = 3; // Min cluster size
+// Distance threshold (15) includes diagonals (14.14) on 10-unit grid
+const int NEIGHBOR_DISTANCE_THRESHOLD = 15;
+const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = (long)NEIGHBOR_DISTANCE_THRESHOLD * NEIGHBOR_DISTANCE_THRESHOLD;
 const int PUMP_ON = HIGH;
 const int PUMP_OFF = LOW;
 const float PUMP_FLOW_RATE_LITERS_PER_MINUTE = 20.0;
@@ -59,21 +106,27 @@ struct SensorNode {
 };
 
 // --- 4. GLOBAL VARIABLES ---
+Preferences prefs; // For saving data
 SystemState currentState = MONITORING;
 const int NUM_SENSORS = 8;
 SensorNode sensorMap[NUM_SENSORS];
-int irrigationFailureCheckCount = 0; // Counts failed "getting wetter" checks
-long lastMoistureSum = 0; // Used to see if moisture is changing
+static_assert(NUM_SENSORS == 8, "NUM_SENSORS is 8, but array sizes or loops may be hardcoded. Update all arrays.");
 
-
-// State Timers
-unsigned long lastCheckTime = 0;
+// Per-State Timers
+unsigned long monTick=0, irrTick=0, waitTick=0, faultTick=0;
 unsigned long pumpStartTime = 0;
 unsigned long wateringStopTime = 0;
+
+// Phase 3 Diagnostics
+int irrigationFailureCheckCount = 0;
+long lastMoistureSum = 0;
+bool unexpectedlyDryLatched = false;
+int lastClusterSize = 0; // For logging
 
 // Daily Metric Variables
 unsigned long timeToWet = 0, timeToDry = 0, wateringDuration = 0, timeSinceLastIrrigation = 0;
 unsigned long dailyCheckTime = 0;
+unsigned long dailyIndex = 0; // Day counter for CSV
 int irrigationFrequencyCount = 0;
 float totalWateringDurationMin = 0;
 float totalLitersUsed = 0;
@@ -97,28 +150,64 @@ int monthlyReportCount = 0;
 // Simulation Variable
 int simulatedValues[NUM_SENSORS];
 
+// --- Forward Declarations ---
+void forcePumpOff();
+
 // --- 5. THE setup() FUNCTION ---
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 Irrigation (PATCHED) Initializing...");
+  Serial.println("ESP32 Irrigation (Refactored) Initializing...");
 
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(MUX_S0_PIN, OUTPUT);
   pinMode(MUX_S1_PIN, OUTPUT);
   pinMode(MUX_S2_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, PUMP_OFF);
+  
+  // --- NEW: Use single function for safety ---
+  forcePumpOff(); // Ensure pump is off at boot
+
+  // Set ADC attenuation for better 0-3.3V range
+  #ifdef ARDUINO_ARCH_ESP32
+    analogSetPinAttenuation(MUX_COMMON_PIN, ADC_11db); // ~3.3V full scale
+  #endif
 
   initializeSensorMap();
-  resetDailyMetrics();    // Initializes daily counters (incl. per-sensor arrays)
-  resetMonthlyMetrics();  // Initializes monthly counters
   
-  // --- FIX 1: Initialize simulation array ---
+  // Run Power-On-Self-Test for channel mapping
+  runPowerOnSelfTest();
+
+  // Load saved monthly totals from flash memory
+  prefs.begin("irrig", false); // Open "irrig" namespace
+  monthlyTotalLitersUsed = prefs.getFloat("monLiters", 0.0);
+  monthlyTotalWateringMin = prefs.getFloat("monMinutes", 0.0);
+  monthlyIrrigationFrequency = prefs.getInt("monIrr", 0);
+  monthlyAvgTimeToWet = prefs.getFloat("monAvgWet", 0.0);
+  monthlyAvgTimeToDry = prefs.getFloat("monAvgDry", 0.0);
+  monthlyAvgFieldMoisture = prefs.getFloat("monAvgMoist", 0.0);
+  monthlyReportCount = prefs.getInt("monCnt", 0);
+  dailyIndex = prefs.getULong("dailyIndex", 0); // Load day counter
+  Serial.print("Loaded previous monthly totals. Starting on Day ");
+  Serial.println(dailyIndex);
+
+  resetDailyMetrics();    // Initializes daily counters
+  // (We don't reset monthly metrics, we just loaded them)
+  
+  // Initialize simulation array
   for (int i = 0; i < NUM_SENSORS; i++) {
     simulatedValues[i] = -1;
   }
   
-  lastCheckTime = millis();
+  // Initialize all per-state timers
+  monTick = millis();
+  irrTick = millis();
+  waitTick = millis();
+  faultTick = millis();
   wateringStopTime = millis();
+  dailyCheckTime = millis();
+  monthlyCheckTime = millis();
+
+  // Print CSV header once on boot
+  Serial.println("CSV_HEADER,dayIndex,millis,cycles,totalLiters,avgWatering,avgWet,avgDry,avgField%");
 }
 
 // --- 6. THE loop() FUNCTION ---
@@ -126,20 +215,23 @@ void loop() {
   checkSerialCommands();
 
   switch (currentState) {
-    case MONITORING: handleMonitoring();    break;
-    case IRRIGATING: handleIrrigating();    break;
-    case WAITING:    handleWaiting();       break;
+    case MONITORING: handleMonitoring(); break;
+    case IRRIGATING: handleIrrigating(); break;
+    case WAITING:    handleWaiting();    break;
     case SYSTEM_FAULT: handleSystemFault(); break;
   }
   
   // 24-hour automatic daily report
-  if (millis() - dailyCheckTime >= MILLIS_PER_DAY) { // 24 hours
+  if (millis() - dailyCheckTime >= MILLIS_PER_DAY) {
     logMoistureAndMetricsReport();
+    logCsvDailySummary(); // Log CSV line
+    dailyIndex++; // Increment day counter
+    prefs.putULong("dailyIndex", dailyIndex); // Save incremented index
     resetDailyMetrics();
   }
 
   // 30-Day automatic monthly report
-  if (millis() - monthlyCheckTime >= MILLIS_PER_30_DAYS) { // 30 days
+  if (millis() - monthlyCheckTime >= MILLIS_PER_30_DAYS) {
     logMonthlyReport();
     resetMonthlyMetrics();
   }
@@ -157,8 +249,34 @@ void checkSerialCommands() {
     Serial.print("COMMAND RECEIVED: ");
     Serial.println(input);
     
-    // 1. Check for Sensor Simulation (e.g., "S3:3500")
-    if (input.startsWith("S")) {
+    // Check for "STATE:" first to prevent collision with "S:"
+    if (input.startsWith("STATE:")) {
+      String newState = input.substring(6);
+      newState.toUpperCase();
+      if (newState == "MONITORING") {
+        currentState = MONITORING;
+        monTick = millis();
+        Serial.println("SIM: State FORCED to MONITORING.");
+      } else if (newState == "IRRIGATING") {
+        currentState = IRRIGATING;
+        pumpStartTime = millis();
+        timeToDry = millis() - wateringStopTime;
+        digitalWrite(RELAY_PIN, PUMP_ON);
+        unexpectedlyDryLatched = false; // Clear latch
+        irrigationFailureCheckCount = 0; // Reset trackers
+        lastMoistureSum = 0;             // Reset trackers
+        Serial.println("SIM: State FORCED to IRRIGATING.");
+      } else if (newState == "WAITING") {
+        currentState = WAITING;
+        wateringStopTime = millis();
+        wateringDuration = millis() - pumpStartTime;
+        timeToWet = millis() - pumpStartTime;
+        forcePumpOff(); // Use safe function
+        Serial.println("SIM: State FORCED to WAITING.");
+      }
+    }
+    // Check for Sensor Simulation (e.g., "S3:3500")
+    else if (input.startsWith("S")) {
       int colonIndex = input.indexOf(':');
       if (colonIndex > 0) {
         int sensorNum = input.substring(1, colonIndex).toInt();
@@ -169,67 +287,61 @@ void checkSerialCommands() {
           Serial.print(sensorNum);
           Serial.print(" override value set to ");
           Serial.println(sensorValue);
+        } else {
+          Serial.println("SIM: Invalid sensor index.");
         }
       }
     }
-    // 2. Check for State Force (e.g., "STATE:MONITORING")
-    else if (input.startsWith("STATE:")) {
-      String newState = input.substring(6);
-      newState.toUpperCase();
-      if (newState == "MONITORING") {
-        currentState = MONITORING;
-        lastCheckTime = millis();
-        Serial.println("SIM: State FORCED to MONITORING.");
-      } else if (newState == "IRRIGATING") {
-        currentState = IRRIGATING;
-        pumpStartTime = millis();
-        timeToDry = millis() - wateringStopTime;
-        digitalWrite(RELAY_PIN, PUMP_ON);
-        Serial.println("SIM: State FORCED to IRRIGATING.");
-      } else if (newState == "WAITING") {
-        currentState = WAITING;
-        wateringStopTime = millis();
-        wateringDuration = millis() - pumpStartTime;
-        timeToWet = millis() - pumpStartTime;
-        digitalWrite(RELAY_PIN, PUMP_OFF);
-        Serial.println("SIM: State FORCED to WAITING.");
-      }
-    }
-    // 3. Check for Report commands
+    // Check for Report commands
     else if (input == "REPORT") {
       Serial.println("SIM: Generating on-demand DAILY report...");
       logMoistureAndMetricsReport();
+      logCsvDailySummary();
     }
     else if (input == "MONTHLY_REPORT") {
       Serial.println("SIM: Generating on-demand MONTHLY report...");
       logMonthlyReport();
     }
-    // --- NEW: Command to reset/clear a fault ---
+    // Check for Timer Skip / Test commands
     else if (input == "FORCE_RESET") {
       Serial.println("SIM: Fault cleared, returning to MONITORING.");
-      digitalWrite(RELAY_PIN, PUMP_OFF); // Ensure pump is off
+      forcePumpOff(); // Use safe function
       currentState = MONITORING;
-      lastCheckTime = millis();
+      monTick = millis();
+      unexpectedlyDryLatched = false; // Clear latch
+      irrigationFailureCheckCount = 0; // Reset trackers
+      lastMoistureSum = 0;             // Reset trackers
     }
-    // 4. Check for Timer Skip commands
-    else if (input == "FORCE_CHECK") { lastCheckTime = 0; Serial.println("SIM: Forcing next MONITORING check."); }
-    else if (input == "FORCE_IRRIGATE_CHECK") { pumpStartTime = 0; Serial.println("SIM: Forcing next IRRIGATING check."); }
+    else if (input == "TEST_PUMP_30S") {
+      Serial.println("SIM: Running pump test for 30s...");
+      digitalWrite(RELAY_PIN, PUMP_ON);
+      unsigned long t0 = millis();
+      while (millis() - t0 < 30 * MILLIS_PER_SECOND) { delay(10); }
+      forcePumpOff(); // Use safe function
+      Serial.println("SIM: Pump test complete.");
+    }
+    else if (input == "FORCE_CHECK") { monTick = 0; Serial.println("SIM: Forcing next MONITORING check."); }
+    else if (input == "FORCE_IRRIGATE_CHECK") { irrTick = 0; Serial.println("SIM: Forcing next IRRIGATING check."); }
+    // NOTE: Setting wateringStopTime = 0 will make timeSinceLastWatering huge
+    // and can intentionally trip "unexpectedly dry/wet" alerts during testing.
     else if (input == "FORCE_WAIT_SKIP") { wateringStopTime = 0; Serial.println("SIM: Forcing WAITING skip."); }
   }
 }
 
 /**
- * @brief State 1: Checks sensors, looks for clusters.
+ * @brief State 1: Checks sensors, looks for clusters, checks for alerts.
  */
 void handleMonitoring() {
-  if (millis() - lastCheckTime >= CHECK_INTERVAL_MS) {
-    lastCheckTime = millis();
+  if (millis() - monTick >= CHECK_INTERVAL_MS) {
+    monTick = millis();
     Serial.println("--- (Monitoring) ---");
-    readAllSensors(); 
+    readAllSensors(); // This now calls printSensorReadings()
+    
+    // Leak Detection Logic
     for (int i = 0; i < NUM_SENSORS; i++) {
       if (sensorMap[i].moisturePercentage >= LEAK_THRESHOLD_PERCENT) {
         Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-        Serial.println("!!! WARNING: POTENTIAL LEAK DETECTED !!!");
+        Serial.print("!!! WARNING: POTENTIAL LEAK DETECTED !!! ");
         Serial.print("Sensor (Ch ");
         Serial.print(sensorMap[i].channel);
         Serial.print(" @ ");
@@ -243,27 +355,44 @@ void handleMonitoring() {
       }
     }
 
-     // --- NEW: Unexpectedly Dry/Wet Alert Logic ---
+    bool dryCluster = checkForCluster();
     unsigned long timeSinceLastWatering = millis() - wateringStopTime;
-    
-    if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_DRY_MS && !checkForCluster() && isAnySensorDry()) {
+
+    // "Unexpectedly Dry" Latch Logic
+    // UNEXPECTEDLY DRY: Fire when (A) we've exceeded the dry-duration budget since the last irrigation,
+    // AND (B) a *dry cluster* (>= MIN_DRY_SENSORS_TO_TRIGGER connected) still exists.
+    // This indicates the field remained dry for too long (system under-watering / supply issue / logic fault).
+    if (!unexpectedlyDryLatched &&
+        timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_DRY_MS &&
+        dryCluster) 
+    {
+      unexpectedlyDryLatched = true; // Set the latch
       Serial.println("!!! ALERT: UNEXPECTEDLY DRY !!!");
-      Serial.println("Field has isolated dry sensors for max time, but no cluster to trigger irrigation.");
-      Serial.println("Check field for isolated dry spots or sensor issues.");
+      Serial.println("Dry cluster persisted beyond max time since last irrigation.");
+      Serial.println("System logic may be failing to water. Check system.");
     }
-    
-    // This check is correct: checks if max wet time has passed AND the field is STILL wet
+    // Clear the latch once condition resolves
+    if (unexpectedlyDryLatched && !dryCluster) {
+      Serial.println("INFO: 'Unexpectedly Dry' condition cleared.");
+      unexpectedlyDryLatched = false;
+    }
+
+    // "Unexpectedly Wet" Alert Logic
     if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_WET_MS && isFieldWet()) { 
         Serial.println("!!! ALERT: UNEXPECTEDLY WET !!!");
         Serial.println("Field has stayed wet for max time limit. Check drainage.");
     }
-    // --- End of New Alert Logic ---
+    // End of Alert Logic
 
-    if (checkForCluster()) {
+
+    if (dryCluster) {
       Serial.println("Dry cluster found!");
+      Serial.print("CLUSTER_SIZE: ");
+      Serial.println(lastClusterSize);
       Serial.println("State change: MONITORING -> IRRIGATING");
+      
       timeToDry = millis() - wateringStopTime;
-      float timeToDryHours = (float)timeToDry / 3600000.0;
+      float timeToDryHours = (float)timeToDry / (float)MILLIS_PER_HOUR;
       totalTimeToDryHours += timeToDryHours;
       Serial.print("METRIC: Field took ");
       Serial.print(timeToDryHours);
@@ -271,6 +400,13 @@ void handleMonitoring() {
       digitalWrite(RELAY_PIN, PUMP_ON);
       pumpStartTime = millis();
       currentState = IRRIGATING;
+      
+      // Clear latch when irrigation starts
+      unexpectedlyDryLatched = false;
+      
+      // Reset failure check counters for new irrigation cycle
+      irrigationFailureCheckCount = 0;
+      lastMoistureSum = 0;
     } else {
       Serial.println("Field is OK. Next check in 1 min.");
     }
@@ -278,9 +414,11 @@ void handleMonitoring() {
 }
 
 /**
- * @brief State 2: Runs pump, checks if field is wet.
+ * @brief State 2: Runs pump, checks for failures, checks if field is wet.
  */
 void handleIrrigating() {
+  
+  // --- Check 1: Max pump time (Irrigation Failure) ---
   if (millis() - pumpStartTime >= MAX_PUMP_ON_TIME_MS) {
     Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     Serial.println("!!! ALERT: IRRIGATION FAILURE (PUMP_ON_MAX) !!!");
@@ -288,31 +426,41 @@ void handleIrrigating() {
     Serial.println("Shutting down system. Check pump/well.");
     Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     
-    digitalWrite(RELAY_PIN, PUMP_OFF);
-    currentState = SYSTEM_FAULT; // Enter the dead fault state
-    return; // Stop all further irrigation logic
+    forcePumpOff();
+    currentState = SYSTEM_FAULT;
+    return; // Exit and go to FAULT state
   }
+  
+  // --- Check 2: Min pump time (Wait before checking) ---
   if (millis() - pumpStartTime < MIN_PUMP_ON_TIME_MS) {
-    if (millis() - lastCheckTime >= 10 * MILLIS_PER_SECOND) {
-        lastCheckTime = millis();
+    // We check the time every 10 seconds to print a status
+    if (millis() - irrTick >= IRRIGATING_CHECK_INTERVAL_MS) {
+        irrTick = millis();
         Serial.print("Irrigating... (Min run time remaining: ");
-        Serial.print((MIN_PUMP_ON_TIME_MS - (millis() - pumpStartTime)) / MILLIS_PER_SECOND);
+        long remIrr = (long)MIN_PUMP_ON_TIME_MS - (long)(millis() - pumpStartTime);
+        if (remIrr < 0) remIrr = 0;
+        Serial.print(remIrr / (long)MILLIS_PER_SECOND);
         Serial.println(" sec)");
     }
-    return;
+    return; // Exit and keep irrigating
   }
-  if (millis() - lastCheckTime >= 10 * MILLIS_PER_SECOND) {
-    lastCheckTime = millis();
+  
+  // --- Check 3: Check if wet (Runs every 10s after min time) ---
+  if (millis() - irrTick >= IRRIGATING_CHECK_INTERVAL_MS) {
+    irrTick = millis();
     Serial.println("Min pump time complete. Checking if field is wet...");
-    readAllSensors();
+    
+    // 1. Read all sensors ONCE (this also prints)
+    readAllSensors(); 
 
+    // 2. Calculate the sum from the data we just read
     long currentMoistureSum = 0;
     for (int i = 0; i < NUM_SENSORS; i++) {
         currentMoistureSum += sensorMap[i].moistureValue;
-    } 
-
-    // --- NEW: Advanced Irrigation Failure Logic ---
-    if (pumpStartTime != 0 && lastMoistureSum != 0) { // Don't check on the very first run
+    }
+    
+    // --- Advanced Irrigation Failure Logic (No Moisture Change) ---
+    if (lastMoistureSum != 0) { // Don't check on the very first run
       if (currentMoistureSum >= lastMoistureSum) { 
         // Soil value *increased* or *stayed same* = NOT GETTING WETTER
         irrigationFailureCheckCount++;
@@ -326,7 +474,7 @@ void handleIrrigating() {
           Serial.println("Pump is ON but moisture is not increasing. Check pump/well.");
           Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
           
-          digitalWrite(RELAY_PIN, PUMP_OFF);
+          forcePumpOff();
           currentState = SYSTEM_FAULT;
           return;
         }
@@ -337,11 +485,15 @@ void handleIrrigating() {
     lastMoistureSum = currentMoistureSum; // Store current sum for next check
     // --- End of Advanced Failure Logic ---
 
-    if (checkIfAllSensorsWet()) {
+    
+    // --- Final Decision ---
+    if (checkIfAllSensorsWet()) { 
       Serial.println("Field is now fully wet.");
       Serial.println("State change: IRRIGATING -> WAITING");
+      
+      // Log all metrics
       wateringDuration = millis() - pumpStartTime;
-      float wateringDurationMin = (float)wateringDuration / 60000.0;
+      float wateringDurationMin = (float)wateringDuration / (float)MILLIS_PER_MINUTE;
       timeToWet = wateringDuration;
       float timeToWetMin = wateringDurationMin;
       float litersUsed = wateringDurationMin * PUMP_FLOW_RATE_LITERS_PER_MINUTE;
@@ -349,7 +501,6 @@ void handleIrrigating() {
       irrigationFrequencyCount++;
       totalWateringDurationMin += wateringDurationMin;
       totalTimeToWetMin += timeToWetMin;
-      // --- FIX 2: Accumulate the total liters used ---
       totalLitersUsed += litersUsed;
       
       Serial.print("METRIC: Pump ran for ");
@@ -362,12 +513,16 @@ void handleIrrigating() {
       Serial.print(litersUsed);
       Serial.println(" Liters used.");
       
-      digitalWrite(RELAY_PIN, PUMP_OFF);
+      // Stop the pump and change state
+      forcePumpOff();
       wateringStopTime = millis();
       currentState = WAITING;
-      lastMoistureSum = 0; // Reset for next cycle
+      
+      // Reset failure trackers on success
+      lastMoistureSum = 0;
       irrigationFailureCheckCount = 0;
     } else {
+      // Clog warning (if any) was already printed inside checkIfAllSensorsWet()
       Serial.println("Field is not wet enough yet. Continuing to water.");
     }
   }
@@ -377,45 +532,58 @@ void handleIrrigating() {
  * @brief State 3: Cooldown period after watering.
  */
 void handleWaiting() {
-  // --- FIX 3: Corrected typo in constant name ---
   if (millis() - wateringStopTime >= POST_IRRIGATION_WAIT_TIME_MS) {
     Serial.println("Cooldown/Lockout complete.");
     Serial.println("State change: WAITING -> MONITORING");
     timeSinceLastIrrigation = millis() - wateringStopTime;
-    lastCheckTime = millis();
+    monTick = millis();
     currentState = MONITORING;
   } else {
-    if (millis() - lastCheckTime >= 60000) {
-      lastCheckTime = millis();
+    if (millis() - waitTick >= MILLIS_PER_MINUTE) {
+      waitTick = millis();
       Serial.print("Post-irrigation cooldown... (Time remaining: ");
-      // --- FIX 3: Corrected typo in constant name ---
-      Serial.print((POST_IRRIGATION_WAIT_TIME_MS - (millis() - wateringStopTime)) / 60000);
+      long remWait = (long)POST_IRRIGATION_WAIT_TIME_MS - (long)(millis() - wateringStopTime);
+      if (remWait < 0) remWait = 0;
+      Serial.print(remWait / (long)MILLIS_PER_MINUTE);
       Serial.println(" min)");
     }
   }
 }
 
+/**
+ * @brief State 4: System Failure
+ */
 void handleSystemFault() {
-  // We do nothing. The system is halted.
-  // We'll just print an alert every 5 seconds.
-  if (millis() - lastCheckTime >= 5 * MILLIS_PER_SECOND) {
-    lastCheckTime = millis();
-    digitalWrite(RELAY_PIN, PUMP_OFF);
-    Serial.println("!!! SYSTEM IN FAULT STATE - MANUAL RESET OR 'FORCE_RESET' REQUIRED !!!");
+  // Defensive pump-off
+  forcePumpOff();
+
+  // Print alert every 5 seconds
+  if (millis() - faultTick >= FAULT_PRINT_INTERVAL_MS) {
+    faultTick = millis();
+    Serial.println("!!! SYSTEM IN FAULT STATE - 'FORCE_RESET' REQUIRED !!!");
   }
 }
 
 /**
+ * @brief NEW: Safe, central function to turn off the pump.
+ */
+void forcePumpOff() {
+  digitalWrite(RELAY_PIN, PUMP_OFF);
+  // Serial.println("SYS: Pump forced OFF."); // Optional: uncomment for more verbose logging
+}
+
+/**
  * @brief Converts a raw 0-4095 ADC value to a 0-100% percentage.
+ * (Note: Higher ADC value = Drier soil, so the map() inverts the range)
  */
 int convertToPercentage(int rawValue) {
-  int percentage = map(rawValue, CALIBRATION_DRY, CALIBRATION_WET, 0, 100);
+  // Use (long) casts for type safety
+  int percentage = map((long)rawValue, (long)CALIBRATION_DRY, (long)CALIBRATION_WET, 0L, 100L);
   return constrain(percentage, 0, 100);
 }
 
 /**
  * @brief (Internal) Prints the sensor readings from the map.
- * (This logic was moved out of readAllSensors)
  */
 void printSensorReadings() {
   for (int i = 0; i < NUM_SENSORS; i++) {
@@ -451,29 +619,13 @@ void readAllSensors() {
     totalMoistureReadingsPerSensor[i]++;
     totalFieldMoistureSum += sensorMap[i].moisturePercentage;
     totalFieldMoistureReadings++;
-    
-    // Print status
-    Serial.print("  Sensor (Ch ");
-    Serial.print(channel);
-    Serial.print(" @ ");
-    Serial.print(sensorMap[i].x);
-    Serial.print(",");
-    Serial.print(sensorMap[i].y);
-    Serial.print("): ");
-    Serial.print(value);
-    Serial.print(" | ");
-    Serial.print(sensorMap[i].moisturePercentage);
-    Serial.print("%");
-    if(sensorMap[i].isDry) Serial.println(" (DRY)");
-    else Serial.println(" (WET)");
   }
-    // Print all readings at once
+  // Print all readings at once
   printSensorReadings();
 }
 
 /**
  * @brief Checks if ALL sensors are wetter than the WET_THRESHOLD.
- * (This logic is correct)
  */
 bool checkIfAllSensorsWet() {
   int stillDryCount = 0;
@@ -481,21 +633,16 @@ bool checkIfAllSensorsWet() {
   int lastDrySensorX = -1, lastDrySensorY = -1;
 
   for (int i = 0; i < NUM_SENSORS; i++) {
-    // If a sensor is "drier" (value >) than the threshold...
     if (sensorMap[i].moistureValue > WET_THRESHOLD) {
-      // ...it's not wet.
       stillDryCount++;
-      lastDrySensorChannel = sensorMap[i].channel; // Record this sensor
+      lastDrySensorChannel = sensorMap[i].channel;
       lastDrySensorX = sensorMap[i].x;
       lastDrySensorY = sensorMap[i].y;
-      // (We no longer print the "still too dry" message here,
-      //  to avoid spamming the log if there's a clog)
     }
   }
 
-  // --- Clog Detection Logic ---
+  // Clog Detection Logic
   if (stillDryCount == 1) {
-    // Only ONE sensor is dry while all others are wet. This is a clog.
     Serial.print("!!! WARNING: POTENTIAL CLOG DETECTED !!! ");
     Serial.print("Sensor (Ch ");
     Serial.print(lastDrySensorChannel);
@@ -505,43 +652,24 @@ bool checkIfAllSensorsWet() {
     Serial.print(lastDrySensorY);
     Serial.println(") is still dry, but all other sensors are wet.");
   }
-  // --- End of Clog Detection ---
 
-  if (stillDryCount == 0) {
-    return true; // ALL sensors are wet
-  } else {
-    return false; // One or more sensors are still dry
-  }
-}
-
-bool isFieldWet() {
-  // If no dry cluster is found, the field is considered wet.
-  return !checkForCluster();
-}
-
-bool isAnySensorDry() {
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    if (sensorMap[i].isDry) {
-      return true; // Found at least one dry sensor
-    }
-  }
-  return false; // No dry sensors found
+  return (stillDryCount == 0);
 }
 
 /**
  * @brief Reads a single sensor from Mux, checking for simulation first.
  */
 int readSensor(int channel) {
-  
-  if (channel < 0 || channel >= NUM_SENSORS) { // NUM_SENSORS is 8
+  // Bounds check
+  if (channel < 0 || channel >= NUM_SENSORS) {
     Serial.print("ERROR: Invalid channel request: ");
     Serial.println(channel);
-    return CALIBRATION_DRY; // Return "dry" reading as safe fallback
+    return CALIBRATION_DRY;
   }
-
+  
   if (simulatedValues[channel] != -1) {
     int simValue = simulatedValues[channel];
-    simulatedValues[channel] = -1; // Use simulation value only once
+    simulatedValues[channel] = -1;
     
     Serial.print("...Using simulated value ");
     Serial.print(simValue);
@@ -551,42 +679,78 @@ int readSensor(int channel) {
     return simValue;
   }
   
-  // Read from hardware
+  // Select hardware channel
   digitalWrite(MUX_S0_PIN, bitRead(channel, 0));
   digitalWrite(MUX_S1_PIN, bitRead(channel, 1));
   digitalWrite(MUX_S2_PIN, bitRead(channel, 2));
-  delay(10);
-  return analogRead(MUX_COMMON_PIN);
+  delayMicroseconds(MUX_SETTLE_TIME_US); // Settle the multiplexer
+  
+  // Take ADC_SAMPLES for de-noising
+  long acc = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    acc += analogRead(MUX_COMMON_PIN);
+    delay(ADC_SAMPLE_DELAY_MS);
+  }
+  return (int)(acc / (long)ADC_SAMPLES);
 }
 
 /**
- * @brief Checks if a "cluster" of dry sensors exists.
+ * @brief Helper function to check if the field is "wet".
+ * "Wet" means "wet enough" (no 3+ dry connected nodes).
  */
+bool isFieldWet() {
+  return !checkForCluster();
+}
+
+/**
+* @brief Advanced clustering check (BFS algorithm).
+* Checks for a "connected component" of 3+ dry sensors.
+*/
 bool checkForCluster() {
-  int dryCount = 0;
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    if (sensorMap[i].isDry) dryCount++;
+  bool dry[NUM_SENSORS];
+  for (int i = 0; i < NUM_SENSORS; i++) dry[i] = sensorMap[i].isDry;
+
+  // Quick exit
+  int dryTotal = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) if (dry[i]) dryTotal++;
+  if (dryTotal < MIN_DRY_SENSORS_TO_TRIGGER) {
+    lastClusterSize = 0; // No cluster
+    return false;
   }
-  if (dryCount < MIN_DRY_SENSORS_TO_TRIGGER) {
-    return false; // Not enough dry sensors
-  }
-  
-  // Check for neighbors
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    if (sensorMap[i].isDry) {
-      for (int j = i + 1; j < NUM_SENSORS; j++) {
-        if (sensorMap[j].isDry) {
-          long dx = sensorMap[i].x - sensorMap[j].x;
-          long dy = sensorMap[i].y - sensorMap[j].y;
-          long distanceSquared = (dx * dx) + (dy * dy);
-          if (distanceSquared <= NEIGHBOR_DISTANCE_THRESHOLD_SQUARED) {
-            return true; // Found a cluster
-          }
+
+  bool visited[NUM_SENSORS] = {false};
+
+  for (int start = 0; start < NUM_SENSORS; start++) {
+    if (!dry[start] || visited[start]) continue;
+
+    // BFS/DFS to count connected dry nodes
+    int queue[NUM_SENSORS]; int qh = 0, qt = 0;
+    queue[qt++] = start; visited[start] = true;
+    int compSize = 0;
+
+    while (qh < qt) {
+      int u = queue[qh++]; compSize++;
+
+      for (int v = 0; v < NUM_SENSORS; v++) {
+        if (u == v || !dry[v] || visited[v]) continue;
+        long dx = sensorMap[u].x - sensorMap[v].x;
+        long dy = sensorMap[u].y - sensorMap[v].y;
+        long d2 = dx*dx + dy*dy;
+        if (d2 <= NEIGHBOR_DISTANCE_THRESHOLD_SQUARED) {
+          visited[v] = true;
+          queue[qt++] = v;
         }
       }
     }
+
+    if (compSize >= MIN_DRY_SENSORS_TO_TRIGGER) {
+      lastClusterSize = compSize; // Log cluster size
+      return true;
+    }
   }
-  return false; // Found dry sensors, but they were all isolated
+  
+  lastClusterSize = 0; // No clusters were large enough
+  return false;
 }
 
 /**
@@ -620,7 +784,6 @@ void logMoistureAndMetricsReport() {
   Serial.print("Irrigation Cycles Today: ");
   Serial.println(irrigationFrequencyCount);
 
-  // Calculate field averages
   float avgFieldMoisture = 0.0;
   if(totalFieldMoistureReadings > 0) {
     avgFieldMoisture = (float)totalFieldMoistureSum / (float)totalFieldMoistureReadings;
@@ -655,11 +818,10 @@ void logMoistureAndMetricsReport() {
   Serial.print("Avg. Time to Dry (Drying Rate): ");
   Serial.print(avgTimeToDry);
   Serial.println(" hours");
-
-  // --- NEW: Soil Health Report Card (Phase 3) ---
+  
+  // 3. Soil Health Report Card
   Serial.println("--- Soil Health Report Card ---");
-  if (irrigationFrequencyCount > 0) { // Only report if we have data
-    // Wetting Rate Diagnosis (Infiltration)
+  if (irrigationFrequencyCount > 0) {
     if (avgTimeToWet > HEALTHY_WETTING_TIME_MIN) {
       Serial.print("DIAGNOSIS: POOR INFILTRATION. Soil took ");
       Serial.print(avgTimeToWet);
@@ -668,7 +830,6 @@ void logMoistureAndMetricsReport() {
       Serial.println("DIAGNOSIS: Good soil infiltration.");
     }
     
-    // Drying Rate Diagnosis (Drainage)
     if (avgTimeToDry > HEALTHY_DRYING_TIME_HOURS) {
       Serial.print("DIAGNOSIS: POOR DRAINAGE. Soil took ");
       Serial.print(avgTimeToDry);
@@ -679,18 +840,46 @@ void logMoistureAndMetricsReport() {
   } else {
     Serial.println("DIAGNOSIS: No irrigation cycles, cannot assess soil health.");
   }
-  // --- End of Soil Health Report ---
-  
   Serial.println("=========================================");
   
-  // 3. Add daily totals to monthly totals
+  // 4. Add daily totals to monthly totals & SAVE to flash
   monthlyIrrigationFrequency += irrigationFrequencyCount;
   monthlyTotalLitersUsed += totalLitersUsed;
   monthlyTotalWateringMin += totalWateringDurationMin;
   monthlyAvgTimeToWet += avgTimeToWet;
   monthlyAvgTimeToDry += avgTimeToDry;
   monthlyAvgFieldMoisture += avgFieldMoisture;
-  monthlyReportCount++; // Increment count of daily reports
+  monthlyReportCount++;
+  
+  // Save monthly totals to flash memory
+  prefs.putFloat("monLiters", monthlyTotalLitersUsed);
+  prefs.putFloat("monMinutes", monthlyTotalWateringMin);
+  prefs.putInt("monIrr", monthlyIrrigationFrequency);
+  prefs.putFloat("monAvgWet", monthlyAvgTimeToWet);
+  prefs.putFloat("monAvgDry", monthlyAvgTimeToDry);
+  prefs.putFloat("monAvgMoist", monthlyAvgFieldMoisture);
+  prefs.putInt("monCnt", monthlyReportCount);
+}
+
+/**
+ * @brief Prints a single CSV line for the daily report.
+ */
+void logCsvDailySummary() {
+  float avgFieldMoisture = (totalFieldMoistureReadings>0) 
+      ? (float)totalFieldMoistureSum / totalFieldMoistureReadings : 0.0;
+  float avgWatering = (irrigationFrequencyCount>0) ? totalWateringDurationMin/irrigationFrequencyCount : 0.0;
+  float avgWet = (irrigationFrequencyCount>0) ? totalTimeToWetMin/irrigationFrequencyCount : 0.0;
+  float avgDry = (irrigationFrequencyCount>0) ? totalTimeToDryHours/irrigationFrequencyCount : 0.0;
+
+  Serial.print("CSV,");
+  Serial.print(dailyIndex); Serial.print(','); // Use the daily index
+  Serial.print(millis()); Serial.print(',');
+  Serial.print(irrigationFrequencyCount); Serial.print(',');
+  Serial.print(totalLitersUsed); Serial.print(',');
+  Serial.print(avgWatering); Serial.print(',');
+  Serial.print(avgWet); Serial.print(',');
+  Serial.print(avgDry); Serial.print(',');
+  Serial.println(avgFieldMoisture);
 }
 
 /**
@@ -735,17 +924,14 @@ void logMonthlyReport() {
   Serial.print("Avg. Time to Dry: ");
   Serial.print(finalAvgTimeToDry);
   Serial.println(" hours");
-
-  // --- NEW: Monthly Soil Health Report ---
+  
   Serial.println("--- Monthly Soil Health Diagnosis ---");
   if (monthlyReportCount > 0) {
-    // Wetting Rate
     if (finalAvgTimeToWet > HEALTHY_WETTING_TIME_MIN) {
       Serial.println("DIAGNOSIS: POOR INFILTRATION (Consistent).");
     } else {
       Serial.println("DIAGNOSIS: Good soil infiltration (Consistent).");
     }
-    // Drying Rate
     if (finalAvgTimeToDry > HEALTHY_DRYING_TIME_HOURS) {
       Serial.println("DIAGNOSIS: POOR DRAINAGE (Consistent).");
     } else {
@@ -754,7 +940,6 @@ void logMonthlyReport() {
   } else {
     Serial.println("DIAGNOSIS: No data to assess.");
   }
-  // --- End of Monthly Report ---
   
   Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 }
@@ -770,7 +955,7 @@ void resetDailyMetrics() {
   totalTimeToDryHours = 0;
   totalFieldMoistureSum = 0;
   totalFieldMoistureReadings = 0;
-  dailyCheckTime = millis(); // Reset 24h timer
+  dailyCheckTime = millis();
 
   for (int i = 0; i < NUM_SENSORS; i++) {
     totalMoistureSumPerSensor[i] = 0;
@@ -779,7 +964,7 @@ void resetDailyMetrics() {
 }
 
 /**
- * @brief Resets all monthly counters.
+ * @brief Resets all monthly counters and clears flash memory.
  */
 void resetMonthlyMetrics() {
   monthlyIrrigationFrequency = 0;
@@ -789,13 +974,49 @@ void resetMonthlyMetrics() {
   monthlyAvgTimeToDry = 0;
   monthlyAvgFieldMoisture = 0;
   monthlyReportCount = 0;
-  monthlyCheckTime = millis(); // Reset 30-day timer
+  dailyIndex = 0; // Reset day counter for the new month
+  monthlyCheckTime = millis();
+  
+  // Explicitly clear keys instead of wipe
+  prefs.putFloat("monLiters", 0.0);
+  prefs.putFloat("monMinutes", 0.0);
+  prefs.putInt("monIrr", 0);
+  prefs.putFloat("monAvgWet", 0.0);
+  prefs.putFloat("monAvgDry", 0.0);
+  prefs.putFloat("monAvgMoist", 0.0);
+  prefs.putInt("monCnt", 0);
+  prefs.putULong("dailyIndex", 0);
+}
+
+/**
+ * @brief Runs a self-test to check channel mapping.
+ */
+void runPowerOnSelfTest() {
+  Serial.println("--- Power-On Self-Test: Channel Map ---");
+  Serial.println("Verifying Sensor Map (X,Y) against Mux Channels...");
+  for (int ch = 0; ch < NUM_SENSORS; ch++) {
+    Serial.print("Mux Channel "); Serial.print(ch);
+    bool found = false;
+    for (int i = 0; i<NUM_SENSORS; i++) {
+      if (sensorMap[i].channel == ch) {
+        Serial.print(" -> Mapped to (X,Y): (");
+        Serial.print(sensorMap[i].x); Serial.print(",");
+        Serial.print(sensorMap[i].y); Serial.println(")");
+        found = true;
+        break;
+      }
+    }
+    if (!found) Serial.println(" -> ERROR: Unmapped channel!");
+  }
+  Serial.println("--- Self-Test Complete ---");
 }
 
 /**
  * @brief Initializes the sensor (X,Y) map.
  */
 void initializeSensorMap() {
+  // NOTE: Channel 0 is assigned last (sensorMap[7])
+  // This is intentional and matches the 2x4 grid
   sensorMap[0] = {10, 10, 1, false, 0, 0}; 
   sensorMap[1] = {10, 20, 2, false, 0, 0}; 
   sensorMap[2] = {10, 30, 3, false, 0, 0};
