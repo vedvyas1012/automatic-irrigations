@@ -33,6 +33,14 @@ const unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE; // (5 minutes)
 // --- FIX 3: Corrected typo ---
 const unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR; // (e.g., 1 hour)
 const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR; // (4 hours)
+// --- NEW: Phase 3 Alert & Report Thresholds ---
+// How long can soil stay dry before it's "unexpected"? (e.g., 7 days)
+const unsigned long MAX_TIME_UNEXPECTEDLY_DRY_MS = 7 * MILLIS_PER_DAY;
+// How long can soil stay wet before it's "unexpected"? (e.g., 3 days)
+const unsigned long MAX_TIME_UNEXPECTEDLY_WET_MS = 3 * MILLIS_PER_DAY;
+// "Healthy" soil report card values (you will need to tune these)
+const float HEALTHY_WETTING_TIME_MIN = 10.0; // (e.g., < 10 min = good infiltration)
+const float HEALTHY_DRYING_TIME_HOURS = 48.0; // (e.g., > 48 hours = poor drainage)
 const int MIN_DRY_SENSORS_TO_TRIGGER = 3;
 const int NEIGHBOR_DISTANCE_THRESHOLD = 12;
 const long NEIGHBOR_DISTANCE_THRESHOLD_SQUARED = 144;
@@ -54,6 +62,9 @@ struct SensorNode {
 SystemState currentState = MONITORING;
 const int NUM_SENSORS = 8;
 SensorNode sensorMap[NUM_SENSORS];
+int irrigationFailureCheckCount = 0; // Counts failed "getting wetter" checks
+long lastMoistureSum = 0; // Used to see if moisture is changing
+
 
 // State Timers
 unsigned long lastCheckTime = 0;
@@ -231,6 +242,27 @@ void handleMonitoring() {
         Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
       }
     }
+
+     // --- NEW: Unexpectedly Dry/Wet Alert Logic ---
+    unsigned long timeSinceLastWatering = millis() - wateringStopTime;
+    
+    if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_DRY_MS && checkForCluster()) {
+      Serial.println("!!! ALERT: UNEXPECTEDLY DRY !!!");
+      Serial.println("Field has been dry for max time limit. Isolated dry sensors detected (no cluster).");
+      Serial.println("This may indicate a logic error or isolated dry sensors.");
+    }
+    
+    // This check is correct: checks if max wet time has passed AND the field is STILL wet
+    if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_WET_MS) {
+      // Check if the field is *actually* still wet
+      // !checkForCluster() means "No dry cluster was found", i.e., the field is WET
+      if (isFieldWet()) { 
+          Serial.println("!!! ALERT: UNEXPECTEDLY WET !!!");
+          Serial.println("Field has stayed wet for max time limit. Check drainage.");
+      }
+    }
+    // --- End of New Alert Logic ---
+
     if (checkForCluster()) {
       Serial.println("Dry cluster found!");
       Serial.println("State change: MONITORING -> IRRIGATING");
@@ -277,6 +309,38 @@ void handleIrrigating() {
     lastCheckTime = millis();
     Serial.println("Min pump time complete. Checking if field is wet...");
     readAllSensors();
+
+    long currentMoistureSum = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        currentMoistureSum += sensorMap[i].moistureValue;
+    } 
+
+    // --- NEW: Advanced Irrigation Failure Logic ---
+    if (pumpStartTime != 0 && lastMoistureSum != 0) { // Don't check on the very first run
+      if (currentMoistureSum >= lastMoistureSum) { 
+        // Soil value *increased* or *stayed same* = NOT GETTING WETTER
+        irrigationFailureCheckCount++;
+        Serial.print("!!! WARNING: Soil moisture is not decreasing! (Check ");
+        Serial.print(irrigationFailureCheckCount);
+        Serial.println(")");
+        
+        if (irrigationFailureCheckCount >= 3) { // 3 failed checks (30s)
+          Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+          Serial.println("!!! ALERT: IRRIGATION FAILURE (NO MOISTURE CHANGE) !!!");
+          Serial.println("Pump is ON but moisture is not increasing. Check pump/well.");
+          Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+          
+          digitalWrite(RELAY_PIN, PUMP_OFF);
+          currentState = SYSTEM_FAULT;
+          return;
+        }
+      } else {
+        irrigationFailureCheckCount = 0; // Reset counter, it's working
+      }
+    }
+    lastMoistureSum = currentMoistureSum; // Store current sum for next check
+    // --- End of Advanced Failure Logic ---
+
     if (checkIfAllSensorsWet()) {
       Serial.println("Field is now fully wet.");
       Serial.println("State change: IRRIGATING -> WAITING");
@@ -305,6 +369,8 @@ void handleIrrigating() {
       digitalWrite(RELAY_PIN, PUMP_OFF);
       wateringStopTime = millis();
       currentState = WAITING;
+      lastMoistureSum = 0; // Reset for next cycle
+      irrigationFailureCheckCount = 0;
     } else {
       Serial.println("Field is not wet enough yet. Continuing to water.");
     }
@@ -352,6 +418,28 @@ int convertToPercentage(int rawValue) {
 }
 
 /**
+ * @brief (Internal) Prints the sensor readings from the map.
+ * (This logic was moved out of readAllSensors)
+ */
+void printSensorReadings() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.print("  Sensor (Ch ");
+    Serial.print(sensorMap[i].channel);
+    Serial.print(" @ ");
+    Serial.print(sensorMap[i].x);
+    Serial.print(",");
+    Serial.print(sensorMap[i].y);
+    Serial.print("): ");
+    Serial.print(sensorMap[i].moistureValue);
+    Serial.print(" | ");
+    Serial.print(sensorMap[i].moisturePercentage);
+    Serial.print("%");
+    if(sensorMap[i].isDry) Serial.println(" (DRY)");
+    else Serial.println(" (WET)");
+  }
+}
+
+/**
  * @brief Reads all sensors and updates their data in the map.
  */
 void readAllSensors() {
@@ -383,6 +471,8 @@ void readAllSensors() {
     if(sensorMap[i].isDry) Serial.println(" (DRY)");
     else Serial.println(" (WET)");
   }
+    // Print all readings at once
+  printSensorReadings();
 }
 
 /**
@@ -427,6 +517,12 @@ bool checkIfAllSensorsWet() {
     return false; // One or more sensors are still dry
   }
 }
+
+bool isFieldWet() {
+  // If no dry cluster is found, the field is considered wet.
+  return !checkForCluster();
+}
+
 /**
  * @brief Reads a single sensor from Mux, checking for simulation first.
  */
@@ -554,6 +650,31 @@ void logMoistureAndMetricsReport() {
   Serial.print("Avg. Time to Dry (Drying Rate): ");
   Serial.print(avgTimeToDry);
   Serial.println(" hours");
+
+  // --- NEW: Soil Health Report Card (Phase 3) ---
+  Serial.println("--- Soil Health Report Card ---");
+  if (irrigationFrequencyCount > 0) { // Only report if we have data
+    // Wetting Rate Diagnosis (Infiltration)
+    if (avgTimeToWet > HEALTHY_WETTING_TIME_MIN) {
+      Serial.print("DIAGNOSIS: POOR INFILTRATION. Soil took ");
+      Serial.print(avgTimeToWet);
+      Serial.println(" mins to get wet (check for soil compaction).");
+    } else {
+      Serial.println("DIAGNOSIS: Good soil infiltration.");
+    }
+    
+    // Drying Rate Diagnosis (Drainage)
+    if (avgTimeToDry > HEALTHY_DRYING_TIME_HOURS) {
+      Serial.print("DIAGNOSIS: POOR DRAINAGE. Soil took ");
+      Serial.print(avgTimeToDry);
+      Serial.println(" hours to dry (check for waterlogging).");
+    } else {
+      Serial.println("DIAGNOSIS: Good soil drainage.");
+    }
+  } else {
+    Serial.println("DIAGNOSIS: No irrigation cycles, cannot assess soil health.");
+  }
+  // --- End of Soil Health Report ---
   
   Serial.println("=========================================");
   
@@ -609,6 +730,26 @@ void logMonthlyReport() {
   Serial.print("Avg. Time to Dry: ");
   Serial.print(finalAvgTimeToDry);
   Serial.println(" hours");
+
+  // --- NEW: Monthly Soil Health Report ---
+  Serial.println("--- Monthly Soil Health Diagnosis ---");
+  if (monthlyReportCount > 0) {
+    // Wetting Rate
+    if (finalAvgTimeToWet > HEALTHY_WETTING_TIME_MIN) {
+      Serial.println("DIAGNOSIS: POOR INFILTRATION (Consistent).");
+    } else {
+      Serial.println("DIAGNOSIS: Good soil infiltration (Consistent).");
+    }
+    // Drying Rate
+    if (finalAvgTimeToDry > HEALTHY_DRYING_TIME_HOURS) {
+      Serial.println("DIAGNOSIS: POOR DRAINAGE (Consistent).");
+    } else {
+      Serial.println("DIAGNOSIS: Good soil drainage (Consistent).");
+    }
+  } else {
+    Serial.println("DIAGNOSIS: No data to assess.");
+  }
+  // --- End of Monthly Report ---
   
   Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 }
