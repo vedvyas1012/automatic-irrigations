@@ -246,20 +246,16 @@ void handleMonitoring() {
      // --- NEW: Unexpectedly Dry/Wet Alert Logic ---
     unsigned long timeSinceLastWatering = millis() - wateringStopTime;
     
-    if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_DRY_MS && checkForCluster()) {
+    if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_DRY_MS && !checkForCluster() && isAnySensorDry()) {
       Serial.println("!!! ALERT: UNEXPECTEDLY DRY !!!");
-      Serial.println("Field has been dry for max time limit. Isolated dry sensors detected (no cluster).");
-      Serial.println("This may indicate a logic error or isolated dry sensors.");
+      Serial.println("Field has isolated dry sensors for max time, but no cluster to trigger irrigation.");
+      Serial.println("Check field for isolated dry spots or sensor issues.");
     }
     
     // This check is correct: checks if max wet time has passed AND the field is STILL wet
-    if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_WET_MS) {
-      // Check if the field is *actually* still wet
-      // !checkForCluster() means "No dry cluster was found", i.e., the field is WET
-      if (isFieldWet()) { 
-          Serial.println("!!! ALERT: UNEXPECTEDLY WET !!!");
-          Serial.println("Field has stayed wet for max time limit. Check drainage.");
-      }
+    if (timeSinceLastWatering >= MAX_TIME_UNEXPECTEDLY_WET_MS && isFieldWet()) { 
+        Serial.println("!!! ALERT: UNEXPECTEDLY WET !!!");
+        Serial.println("Field has stayed wet for max time limit. Check drainage.");
     }
     // --- End of New Alert Logic ---
 
@@ -521,6 +517,15 @@ bool checkIfAllSensorsWet() {
 bool isFieldWet() {
   // If no dry cluster is found, the field is considered wet.
   return !checkForCluster();
+}
+
+bool isAnySensorDry() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (sensorMap[i].isDry) {
+      return true; // Found at least one dry sensor
+    }
+  }
+  return false; // No dry sensors found
 }
 
 /**
