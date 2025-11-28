@@ -2,7 +2,7 @@
 
 ## 🔧 Setup (One-Time)
 
-1. **Edit WiFi credentials** (lines 94-95):
+1. **Edit WiFi credentials** - search for `const char* ssid` in the .ino file:
    ```cpp
    const char* ssid = "YOUR_WIFI";
    const char* password = "YOUR_PASSWORD";
@@ -51,16 +51,28 @@ Type these in Serial Monitor (115200 baud):
 
 ---
 
-## ⚙️ Key Thresholds
+## ⚙️ Configuration Parameters (config.json)
+
+### Threshold Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | DRY_THRESHOLD | 3000 | Irrigation starts when sensor > this |
 | WET_THRESHOLD | 1500 | Irrigation stops when all sensors < this |
-| MIN_PUMP_TIME | 5 min | Minimum irrigation duration |
-| MAX_PUMP_TIME | 60 min | Maximum before fault |
-| COOLDOWN | 4 hours | Waiting period after irrigation |
-| CHECK_INTERVAL | 1 min | Monitoring check frequency |
+| CALIBRATION_DRY | 3500 | ADC reading in air (0% moisture) |
+| CALIBRATION_WET | 1200 | ADC reading in water (100% moisture) |
+| LEAK_THRESHOLD_PERCENT | 98 | Alert if moisture > this % while pump off |
+| ADC_SAMPLES | 5 | Readings averaged per sensor |
+
+### Timing Settings
+
+| Setting | Default | Human-Readable | Description |
+|---------|---------|----------------|-------------|
+| CHECK_INTERVAL_MS | 60000 | 1 min | Monitoring check frequency |
+| MIN_PUMP_ON_TIME_MS | 300000 | 5 min | Minimum irrigation duration |
+| MAX_PUMP_ON_TIME_MS | 3600000 | 60 min | Maximum before fault |
+| POST_IRRIGATION_WAIT_TIME_MS | 14400000 | 4 hours | Cooldown after irrigation |
+| IRRIGATING_CHECK_INTERVAL_MS | 10000 | 10 sec | Wetness check while irrigating |
 
 Edit via `config.json` upload (no code changes needed!)
 
@@ -70,9 +82,9 @@ Edit via `config.json` upload (no code changes needed!)
 
 | State | Color (Web) | Meaning |
 |-------|-------------|---------|
-| **MONITORING** | Gray | Checking sensors every 1 min |
+| **MONITORING** | Gray | Checking sensors periodically |
 | **IRRIGATING** | Green | Pump ON, watering field |
-| **WAITING** | Gray | 4-hour cooldown after watering |
+| **WAITING** | Gray | Cooldown after watering |
 | **SYSTEM_FAULT** | Red | Error detected, pump OFF |
 
 ---
@@ -82,7 +94,7 @@ Edit via `config.json` upload (no code changes needed!)
 **Leak Detection**: Sensor >98% moisture while pump OFF
 **Clog Detection**: 7 sensors wet, 1 dry after irrigation
 **Pump Failure**:
-- Pump runs 60 min without wetting field
+- Pump runs max time without wetting field
 - Moisture not increasing after 3 checks
 
 **Unexpectedly Dry**: Dry cluster persists >7 days
@@ -133,6 +145,10 @@ Edit via `config.json` upload (no code changes needed!)
 - **More aggressive**: Lower DRY_THRESHOLD (e.g., 2800)
 - **Less frequent**: Raise DRY_THRESHOLD (e.g., 3200)
 
+### Change Timing:
+- **Faster checks**: Lower CHECK_INTERVAL_MS (e.g., 30000 = 30s)
+- **Longer soak**: Increase MIN_PUMP_ON_TIME_MS (e.g., 600000 = 10min)
+
 ### Upload New Config:
 1. Edit `config.json` on computer
 2. Web dashboard → "Upload Config" tab
@@ -177,12 +193,13 @@ Edit via `config.json` upload (no code changes needed!)
 
 - `PHASE4_GUIDE.md` - Complete setup guide
 - `CHANGES_SUMMARY.md` - Technical documentation
+- `TEST_CHECKLIST.md` - Testing verification
 - Serial Monitor - Real-time debugging
 - Web dashboard - Visual status
 
 ---
 
-## 🎓 Pin Reference
+## 🎛️ Pin Reference
 
 | Component | ESP32 Pin |
 |-----------|-----------|
@@ -194,9 +211,19 @@ Edit via `config.json` upload (no code changes needed!)
 
 ---
 
-**Version**: 4.0 (Phase 4 Complete)
-**Last Updated**: 2025-11-27
-**Total Lines**: 1422
+## 📈 Performance Baseline
+
+| Metric | Expected Value |
+|--------|---------------|
+| Dashboard refresh | 3 seconds |
+| Dashboard load time | < 3 seconds |
+| Config upload time | < 2 seconds |
+| Free heap memory | > 100KB |
+
+---
+
+**Version**: 4.1 (All Improvements Complete)
+**Last Updated**: 2025-11-29
 
 ---
 

@@ -11,7 +11,6 @@ Phase 4 adds WiFi connectivity, a live web dashboard, and dynamic configuration 
 - Connects to your WiFi network on boot
 - 15-second timeout with graceful fallback
 - Continues irrigation logic even if WiFi fails
-- Edit credentials in code (lines 88-89) or via config.json
 
 ### 2. Web Dashboard
 - **Live Status Display**: Shows current system state (MONITORING/IRRIGATING/WAITING/FAULT)
@@ -45,7 +44,7 @@ Phase 4 adds WiFi connectivity, a live web dashboard, and dynamic configuration 
    - `ArduinoJson` (v6.x)
    - `SPIFFS` (built-in)
    - `Preferences` (built-in)
-3. Edit WiFi credentials (lines 88-89):
+3. Search for `const char* ssid` and edit WiFi credentials:
    ```cpp
    const char* ssid = "YOUR_WIFI_NAME";
    const char* password = "YOUR_PASSWORD";
@@ -71,7 +70,7 @@ Phase 4 adds WiFi connectivity, a live web dashboard, and dynamic configuration 
 
 ## Configuration File Format
 
-The `config.json` file allows you to customize system behavior:
+The `config.json` file supports **13 configurable parameters**:
 
 ```json
 {
@@ -82,11 +81,18 @@ The `config.json` file allows you to customize system behavior:
   "LEAK_THRESHOLD_PERCENT": 98,
   "ADC_SAMPLES": 5,
   "MUX_SETTLE_TIME_US": 800,
-  "ADC_SAMPLE_DELAY_MS": 1
+  "ADC_SAMPLE_DELAY_MS": 1,
+  "CHECK_INTERVAL_MS": 60000,
+  "MIN_PUMP_ON_TIME_MS": 300000,
+  "MAX_PUMP_ON_TIME_MS": 3600000,
+  "POST_IRRIGATION_WAIT_TIME_MS": 14400000,
+  "IRRIGATING_CHECK_INTERVAL_MS": 10000
 }
 ```
 
 ### Configuration Parameters
+
+#### Calibration & Threshold Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -98,6 +104,16 @@ The `config.json` file allows you to customize system behavior:
 | `ADC_SAMPLES` | 5 | Number of samples for noise filtering |
 | `MUX_SETTLE_TIME_US` | 800 | Multiplexer settling time (microseconds) |
 | `ADC_SAMPLE_DELAY_MS` | 1 | Delay between ADC samples (milliseconds) |
+
+#### Timing Parameters
+
+| Parameter | Default | Human-Readable | Description |
+|-----------|---------|----------------|-------------|
+| `CHECK_INTERVAL_MS` | 60000 | 1 minute | Sensor check frequency in MONITORING state |
+| `MIN_PUMP_ON_TIME_MS` | 300000 | 5 minutes | Minimum pump run before checking wetness |
+| `MAX_PUMP_ON_TIME_MS` | 3600000 | 1 hour | Maximum pump run before FAULT state |
+| `POST_IRRIGATION_WAIT_TIME_MS` | 14400000 | 4 hours | Cooldown after irrigation |
+| `IRRIGATING_CHECK_INTERVAL_MS` | 10000 | 10 seconds | Wetness check frequency while irrigating |
 
 ### Calibration Guide
 
@@ -163,7 +179,7 @@ Uploads `config.json` file to SPIFFS.
 ## Troubleshooting
 
 ### WiFi Not Connecting
-1. Check SSID and password spelling
+1. Check SSID and password spelling (case-sensitive)
 2. Ensure 2.4GHz network (ESP32 doesn't support 5GHz)
 3. Check Serial Monitor for error messages
 4. System will continue irrigation logic even without WiFi
@@ -176,7 +192,7 @@ Uploads `config.json` file to SPIFFS.
 
 ### Config Upload Fails
 1. Ensure file is named exactly `config.json`
-2. Check file size (<1KB recommended)
+2. Check file size (<2KB recommended)
 3. Verify JSON syntax using a validator
 4. Check Serial Monitor for error messages
 
@@ -188,44 +204,11 @@ Uploads `config.json` file to SPIFFS.
 
 ---
 
-## Code Architecture
-
-### New Functions Added
-
-1. **`setupWiFi()`** (line 224)
-   - Connects to WiFi with 15-second timeout
-   - Graceful fallback if connection fails
-
-2. **`setupSPIFFS()`** (line 250)
-   - Initializes SPIFFS filesystem
-   - Lists all files for debugging
-
-3. **`loadConfigFromSPIFFS()`** (line 277)
-   - Loads `/config.json` from SPIFFS
-   - Parses JSON and applies settings
-   - Validates config (e.g., WET < DRY)
-
-4. **`handleRoot()`** (line 345)
-   - Serves HTML dashboard from PROGMEM
-
-5. **`handleData()`** (line 352)
-   - Returns live sensor data as JSON
-   - Called every 3 seconds by dashboard
-
-6. **`handleSerialCommand()`** (line 389)
-   - Processes commands sent from web interface
-
-7. **`handleUpload()`** (line 411)
-   - Handles config.json upload completion
-
-8. **`handleFileUpload()`** (line 420)
-   - Receives uploaded file data chunks
-
-### Memory Usage
+## Memory Usage
 
 - HTML page stored in PROGMEM (flash) to save RAM
-- JSON buffer: 1024 bytes for sensor data
-- Config buffer: 512 bytes for configuration
+- JSON buffer: 2048 bytes for sensor data response
+- Config buffer: 1024 bytes for configuration parsing
 - SPIFFS: Uses ESP32 flash partition (typically 1-4MB available)
 
 ---
@@ -251,11 +234,9 @@ Potential improvements for Phase 5:
 1. **Authentication**: Add username/password to web interface
 2. **HTTPS**: Enable SSL/TLS encryption
 3. **MQTT**: Add IoT integration for cloud monitoring
-4. **Alexa/Google Home**: Voice control integration
-5. **Push Notifications**: SMS/Email alerts for faults
-6. **Historical Charts**: Graph moisture trends over time
-7. **OTA Updates**: Upload firmware via web interface
-8. **Multi-ESP32**: Control multiple irrigation zones
+4. **Push Notifications**: SMS/Email alerts for faults
+5. **Historical Charts**: Graph moisture trends over time
+6. **OTA Updates**: Upload firmware via web interface
 
 ---
 
@@ -274,16 +255,6 @@ Potential improvements for Phase 5:
 - [x] Invalid config falls back to defaults
 - [x] System works without WiFi connection
 - [x] SPIFFS lists files on boot
-
----
-
-## Support
-
-For issues or questions:
-1. Check Serial Monitor output (115200 baud)
-2. Verify all libraries are installed
-3. Test with default config first
-4. Check ESP32 board version (2.0.0+)
 
 ---
 

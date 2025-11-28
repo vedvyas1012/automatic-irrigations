@@ -8,7 +8,7 @@ All Phase 4 features have been successfully implemented. Your ESP32 irrigation s
 ## ✅ What Was Fixed
 
 ### 1. **Missing IP Address in JSON Response**
-**Location:** `handleData()` function (line 412)
+**Location:** `handleData()` function
 
 **Problem:** HTML dashboard expected `data.ip` but it wasn't being sent.
 
@@ -42,7 +42,7 @@ server.on("/upload", HTTP_POST, handleUpload, handleFileUpload);
 ```
 
 ### 4. **Hardcoded Thresholds**
-**Changed:** All critical settings from `const` to mutable `int`
+**Changed:** All critical settings from `const` to mutable variables
 
 **Before:**
 ```cpp
@@ -54,7 +54,9 @@ const int DRY_THRESHOLD = 3000;
 int DRY_THRESHOLD = 3000; // Can be overridden by config.json
 ```
 
-**Modified Variables:**
+**All Configurable Variables (13 total):**
+
+*Calibration & Threshold Parameters:*
 - CALIBRATION_DRY
 - CALIBRATION_WET
 - DRY_THRESHOLD
@@ -63,6 +65,13 @@ int DRY_THRESHOLD = 3000; // Can be overridden by config.json
 - ADC_SAMPLES
 - MUX_SETTLE_TIME_US
 - ADC_SAMPLE_DELAY_MS
+
+*Timing Parameters:*
+- CHECK_INTERVAL_MS
+- MIN_PUMP_ON_TIME_MS
+- MAX_PUMP_ON_TIME_MS
+- POST_IRRIGATION_WAIT_TIME_MS
+- IRRIGATING_CHECK_INTERVAL_MS
 
 ### 5. **Static Assertions Removed**
 **Problem:** Compile-time checks don't work with mutable variables.
@@ -79,28 +88,25 @@ if (WET_THRESHOLD >= DRY_THRESHOLD) {
 ## 📁 New Files Created
 
 ### 1. `config.json`
-Sample configuration file with default values. Users can:
+Sample configuration file with all 13 parameters. Users can:
 - Edit locally and upload via web interface
 - Modify without re-uploading Arduino code
-- Tune irrigation sensitivity on-the-fly
+- Tune irrigation sensitivity and timing on-the-fly
 
-### 2. `PHASE4_GUIDE.md`
-Complete user manual including:
-- Quick start guide
-- WiFi setup instructions
-- SPIFFS upload tutorial
-- Configuration tuning guide
-- Troubleshooting section
-- API documentation
-
-### 3. `CHANGES_SUMMARY.md` (this file)
-Technical documentation of all changes made.
+### 2. Documentation Files
+- `PHASE4_GUIDE.md` - Complete user manual
+- `PHASE4_README.md` - Detailed feature documentation
+- `QUICK_REFERENCE.md` - Quick reference card
+- `TEST_CHECKLIST.md` - Testing verification checklist
+- `ALL_IMPROVEMENTS_COMPLETE.md` - Complete improvement history
 
 ---
 
 ## 🔧 Code Structure Changes
 
-### Setup Function Order (lines 147-223)
+### Setup Function Order
+Located in `setup()` function - search for "void setup()":
+
 ```cpp
 void setup() {
   Serial.begin(115200);
@@ -129,7 +135,9 @@ void setup() {
 }
 ```
 
-### Loop Function (lines 227-240)
+### Loop Function
+Located in `loop()` function - search for "void loop()":
+
 ```cpp
 void loop() {
   // NEW: Handle web requests
@@ -143,7 +151,14 @@ void loop() {
 }
 ```
 
-### New Section: Phase 4 Functions (lines 265-644)
+### Phase 4 Functions Section
+Located between comment markers:
+```cpp
+// ============================================================
+// PHASE 4: WiFi, SPIFFS, and Web Server Functions
+// ============================================================
+```
+
 All WiFi, SPIFFS, and web server code organized in one block:
 - WiFi connection
 - SPIFFS initialization
@@ -260,9 +275,9 @@ All WiFi, SPIFFS, and web server code organized in one block:
 - **Reason:** Reports can be very long (100+ lines)
 - **Future:** Add JSON report API or log file viewing
 
-### 4. **No Config Validation on Upload**
-- Invalid JSON accepted but ignored
-- **Mitigation:** Runtime validation catches bad values
+### 4. **Config Validation**
+- Runtime validation catches bad values and uses defaults
+- Validated parameters: thresholds and all timing parameters
 
 ### 5. **SPIFFS Size Limit**
 - Default partition is small (~1.5MB for SPIFFS)
@@ -276,6 +291,11 @@ All WiFi, SPIFFS, and web server code organized in one block:
 - SRAM: +~15KB (web server buffers, JSON docs)
 - Flash: +~25KB (HTML page in PROGMEM, new functions)
 - SPIFFS: ~2KB (config.json)
+
+**Buffer Sizes:**
+- JSON response buffer: 2048 bytes (for sensor data)
+- Config parsing buffer: 1024 bytes
+- Max config file size: 2048 bytes
 
 **CPU Impact:**
 - `server.handleClient()` in loop: ~1-2ms per call (negligible)
@@ -292,10 +312,11 @@ All WiFi, SPIFFS, and web server code organized in one block:
 ✅ Forward declarations for all new functions
 ✅ Comprehensive error handling (WiFi timeout, SPIFFS fail, bad JSON)
 ✅ Graceful degradation (system works without WiFi/SPIFFS)
-✅ Runtime validation of config values
-✅ Clear separation of Phase 4 code (line markers)
+✅ Runtime validation of config values (thresholds + timing)
+✅ Clear separation of Phase 4 code (comment markers)
 ✅ HTML in PROGMEM (saves SRAM)
 ✅ Detailed Serial logging for debugging
+✅ File handle cleanup in SPIFFS operations
 
 ### Potential Improvements (Future):
 - Move HTML to separate file in SPIFFS (easier editing)
@@ -308,27 +329,32 @@ All WiFi, SPIFFS, and web server code organized in one block:
 
 ## 📝 Version History
 
-### v4.0 (Phase 4 Complete) - 2025-11-27
+### v4.1 (Current) - All Improvements Complete
+- ✅ All 13 parameters configurable via JSON
+- ✅ Runtime validation for timing parameters
+- ✅ Increased buffer sizes for reliability
+- ✅ File handle cleanup in SPIFFS listing
+- ✅ Complete documentation update
+
+### v4.0 (Phase 4 Complete)
 - ✅ WiFi connectivity
 - ✅ Web dashboard with live sensor data
 - ✅ SPIFFS filesystem
 - ✅ Dynamic configuration via config.json upload
 - ✅ Remote report triggering
-- ✅ Fixed IP address in JSON response
-- ✅ Complete documentation
 
-### v3.0 (Phase 3) - Previous
+### v3.0 (Phase 3)
 - Advanced diagnostics
 - Daily/Monthly reports
 - CSV logging
 - Flash persistence
 
-### v2.0 (Phase 2) - Previous
+### v2.0 (Phase 2)
 - BFS cluster algorithm
 - Dual-threshold logic
 - State machine
 
-### v1.0 (Phase 1) - Initial
+### v1.0 (Phase 1)
 - Basic sensor reading
 - Multiplexer support
 - Simple pump control

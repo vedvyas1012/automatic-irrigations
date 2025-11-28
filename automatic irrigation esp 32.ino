@@ -51,11 +51,11 @@ int ADC_SAMPLE_DELAY_MS = 1; // (milliseconds)
 // static_assert(ADC_SAMPLES > 0, "ADC_SAMPLES must be at least 1");
 
 // --- TIMING ---
-const unsigned long CHECK_INTERVAL_MS = 1 * MILLIS_PER_MINUTE;
-const unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE;
-const unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR;
-const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR;
-const unsigned long IRRIGATING_CHECK_INTERVAL_MS = 10 * MILLIS_PER_SECOND;
+unsigned long CHECK_INTERVAL_MS = 1 * MILLIS_PER_MINUTE;
+unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE;
+unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR;
+unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR;
+unsigned long IRRIGATING_CHECK_INTERVAL_MS = 10 * MILLIS_PER_SECOND;
 const unsigned long FAULT_PRINT_INTERVAL_MS = 5 * MILLIS_PER_SECOND;
 
 // --- ALERTS & REPORTING ---
@@ -132,11 +132,15 @@ int monthlyReportCount = 0;
 // Simulation Variable
 int simulatedValues[NUM_SENSORS];
 
+// File upload variable (global handle for chunked uploads)
+File uploadFile;
+
 // --- Forward Declarations ---
 void forcePumpOff();
 void setupWiFi();
 void setupSPIFFS();
 void loadConfigFromSPIFFS();
+void createDefaultConfig();
 void handleRoot();
 void handleData();
 void handleSerialCommand();
@@ -304,6 +308,12 @@ void setupSPIFFS() {
   }
   Serial.println("SPIFFS mounted successfully.");
 
+  // Create default config if it doesn't exist
+  if (!SPIFFS.exists("/config.json")) {
+    Serial.println("config.json not found. Creating default...");
+    createDefaultConfig();
+  }
+
   // List files (for debugging)
   File root = SPIFFS.open("/");
   File file = root.openNextFile();
@@ -314,8 +324,10 @@ void setupSPIFFS() {
     Serial.print(" (");
     Serial.print(file.size());
     Serial.println(" bytes)");
+    file.close();  // Close file handle before getting next
     file = root.openNextFile();
   }
+  root.close();  // Close root directory handle
 }
 
 /**
@@ -337,7 +349,7 @@ void loadConfigFromSPIFFS() {
   }
 
   size_t size = configFile.size();
-  if (size > 1024) {
+  if (size > 3072) {
     Serial.println("ERROR: config.json is too large!");
     configFile.close();
     return;
@@ -349,7 +361,7 @@ void loadConfigFromSPIFFS() {
   configFile.close();
 
   // Parse JSON
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<4096> doc;
   DeserializationError error = deserializeJson(doc, buf.get());
 
   if (error) {
@@ -358,26 +370,47 @@ void loadConfigFromSPIFFS() {
     return;
   }
 
-  // Load values (with defaults if keys don't exist)
-  CALIBRATION_DRY = doc["CALIBRATION_DRY"] | CALIBRATION_DRY;
-  CALIBRATION_WET = doc["CALIBRATION_WET"] | CALIBRATION_WET;
-  DRY_THRESHOLD = doc["DRY_THRESHOLD"] | DRY_THRESHOLD;
-  WET_THRESHOLD = doc["WET_THRESHOLD"] | WET_THRESHOLD;
-  LEAK_THRESHOLD_PERCENT = doc["LEAK_THRESHOLD_PERCENT"] | LEAK_THRESHOLD_PERCENT;
-  ADC_SAMPLES = doc["ADC_SAMPLES"] | ADC_SAMPLES;
-  MUX_SETTLE_TIME_US = doc["MUX_SETTLE_TIME_US"] | MUX_SETTLE_TIME_US;
-  ADC_SAMPLE_DELAY_MS = doc["ADC_SAMPLE_DELAY_MS"] | ADC_SAMPLE_DELAY_MS;
+  // Load threshold values (with defaults if keys don't exist)
+  if (doc.containsKey("CALIBRATION_DRY")) CALIBRATION_DRY = doc["CALIBRATION_DRY"];
+  if (doc.containsKey("CALIBRATION_WET")) CALIBRATION_WET = doc["CALIBRATION_WET"];
+  if (doc.containsKey("DRY_THRESHOLD")) DRY_THRESHOLD = doc["DRY_THRESHOLD"];
+  if (doc.containsKey("WET_THRESHOLD")) WET_THRESHOLD = doc["WET_THRESHOLD"];
+  if (doc.containsKey("LEAK_THRESHOLD_PERCENT")) LEAK_THRESHOLD_PERCENT = doc["LEAK_THRESHOLD_PERCENT"];
+  if (doc.containsKey("ADC_SAMPLES")) ADC_SAMPLES = max(1, (int)doc["ADC_SAMPLES"]);
+  if (doc.containsKey("MUX_SETTLE_TIME_US")) MUX_SETTLE_TIME_US = doc["MUX_SETTLE_TIME_US"];
+  if (doc.containsKey("ADC_SAMPLE_DELAY_MS")) ADC_SAMPLE_DELAY_MS = doc["ADC_SAMPLE_DELAY_MS"];
 
-  // Runtime validation
+  // Load timing parameters if present
+  if (doc.containsKey("CHECK_INTERVAL_MS")) CHECK_INTERVAL_MS = doc["CHECK_INTERVAL_MS"];
+  if (doc.containsKey("MIN_PUMP_ON_TIME_MS")) MIN_PUMP_ON_TIME_MS = doc["MIN_PUMP_ON_TIME_MS"];
+  if (doc.containsKey("MAX_PUMP_ON_TIME_MS")) MAX_PUMP_ON_TIME_MS = doc["MAX_PUMP_ON_TIME_MS"];
+  if (doc.containsKey("POST_IRRIGATION_WAIT_TIME_MS")) POST_IRRIGATION_WAIT_TIME_MS = doc["POST_IRRIGATION_WAIT_TIME_MS"];
+  if (doc.containsKey("IRRIGATING_CHECK_INTERVAL_MS")) IRRIGATING_CHECK_INTERVAL_MS = doc["IRRIGATING_CHECK_INTERVAL_MS"];
+
+  // Runtime validation for thresholds
   if (WET_THRESHOLD >= DRY_THRESHOLD) {
     Serial.println("WARNING: WET_THRESHOLD >= DRY_THRESHOLD in config! Using defaults.");
     WET_THRESHOLD = 1500;
     DRY_THRESHOLD = 3000;
   }
 
-  if (ADC_SAMPLES < 1) {
-    Serial.println("WARNING: ADC_SAMPLES < 1 in config! Using default (5).");
-    ADC_SAMPLES = 5;
+  // Runtime validation for timing parameters
+  if (CHECK_INTERVAL_MS < 1000) {
+    Serial.println("WARNING: CHECK_INTERVAL_MS < 1s! Using 60000ms.");
+    CHECK_INTERVAL_MS = 60000;
+  }
+  if (IRRIGATING_CHECK_INTERVAL_MS < 1000) {
+    Serial.println("WARNING: IRRIGATING_CHECK_INTERVAL_MS < 1s! Using 10000ms.");
+    IRRIGATING_CHECK_INTERVAL_MS = 10000;
+  }
+  if (MIN_PUMP_ON_TIME_MS >= MAX_PUMP_ON_TIME_MS) {
+    Serial.println("WARNING: MIN_PUMP >= MAX_PUMP time! Using defaults.");
+    MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE;
+    MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR;
+  }
+  if (POST_IRRIGATION_WAIT_TIME_MS < MILLIS_PER_MINUTE) {
+    Serial.println("WARNING: POST_IRRIGATION_WAIT < 1min! Using 4 hours.");
+    POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR;
   }
 
   Serial.println("Configuration loaded successfully:");
@@ -385,6 +418,36 @@ void loadConfigFromSPIFFS() {
   Serial.print("  WET_THRESHOLD: "); Serial.println(WET_THRESHOLD);
   Serial.print("  CALIBRATION_DRY: "); Serial.println(CALIBRATION_DRY);
   Serial.print("  CALIBRATION_WET: "); Serial.println(CALIBRATION_WET);
+}
+
+/**
+ * @brief Creates a default config.json file if it doesn't exist
+ */
+void createDefaultConfig() {
+  const char* defConfig = R"({
+  "CALIBRATION_DRY": 3500,
+  "CALIBRATION_WET": 1200,
+  "DRY_THRESHOLD": 3000,
+  "WET_THRESHOLD": 1500,
+  "LEAK_THRESHOLD_PERCENT": 98,
+  "ADC_SAMPLES": 5,
+  "MUX_SETTLE_TIME_US": 800,
+  "ADC_SAMPLE_DELAY_MS": 1,
+  "CHECK_INTERVAL_MS": 60000,
+  "MIN_PUMP_ON_TIME_MS": 300000,
+  "MAX_PUMP_ON_TIME_MS": 3600000,
+  "POST_IRRIGATION_WAIT_TIME_MS": 14400000,
+  "IRRIGATING_CHECK_INTERVAL_MS": 10000
+})";
+
+  File file = SPIFFS.open("/config.json", "w");
+  if (file) {
+    file.print(defConfig);
+    file.close();
+    Serial.println("Default config.json created successfully.");
+  } else {
+    Serial.println("ERROR: Failed to create default config.json");
+  }
 }
 
 /**
@@ -398,7 +461,7 @@ void handleRoot() {
  * @brief Handles requests for live data (at '/data')
  */
 void handleData() {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
 
   // Add the current system state
   switch(currentState) {
@@ -472,26 +535,33 @@ void handleFileUpload() {
     Serial.print("Receiving file: ");
     Serial.println(upload.filename);
 
-    // Open file for writing (overwrites if exists)
-    File file = SPIFFS.open("/config.json", "w");
-    if (!file) {
-      Serial.println("ERROR: Failed to open file for writing!");
+    // Validate filename
+    if (String(upload.filename) != "config.json") {
+      Serial.println("ERROR: Rejecting upload - filename must be config.json");
       return;
     }
-    file.close();
+
+    // Remove old file and open new one
+    SPIFFS.remove("/config.json");
+    uploadFile = SPIFFS.open("/config.json", "w");
+    if (!uploadFile) {
+      Serial.println("ERROR: Failed to open file for writing!");
+    }
   }
   else if (upload.status == UPLOAD_FILE_WRITE) {
-    // Write chunk to file
-    File file = SPIFFS.open("/config.json", "a"); // Append mode
-    if (file) {
-      file.write(upload.buf, upload.currentSize);
-      file.close();
+    // Write chunk to global file handle
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
     }
   }
   else if (upload.status == UPLOAD_FILE_END) {
-    Serial.print("Upload complete: ");
-    Serial.print(upload.totalSize);
-    Serial.println(" bytes");
+    // Close file and report completion
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.print("Upload complete: ");
+      Serial.print(upload.totalSize);
+      Serial.println(" bytes");
+    }
   }
 }
 
@@ -656,6 +726,7 @@ void checkSerialCommands() {
     // Check for "STATE:" first to prevent collision with "S:"
     if (input.startsWith("STATE:")) {
       String newState = input.substring(6);
+      newState.trim();
       newState.toUpperCase();
       if (newState == "MONITORING") {
         currentState = MONITORING;
@@ -968,8 +1039,13 @@ void forcePumpOff() {
  * (Note: Higher ADC value = Drier soil, so the map() inverts the range)
  */
 int convertToPercentage(int rawValue) {
-  // Use (long) casts for type safety
-  int percentage = map((long)rawValue, (long)CALIBRATION_DRY, (long)CALIBRATION_WET, 0L, 100L);
+  // Clip input to valid calibration range first (prevents out-of-range mapping)
+  long clipped = rawValue;
+  if (clipped < CALIBRATION_WET) clipped = CALIBRATION_WET;
+  if (clipped > CALIBRATION_DRY) clipped = CALIBRATION_DRY;
+
+  // Map clipped value (Higher ADC = Drier, so invert)
+  int percentage = map(clipped, (long)CALIBRATION_DRY, (long)CALIBRATION_WET, 0L, 100L);
   return constrain(percentage, 0, 100);
 }
 

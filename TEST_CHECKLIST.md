@@ -21,11 +21,17 @@ Go to Tools menu:
 - [ ] **Port**: Select correct COM/USB port
 
 ### 3. WiFi Credentials
-Edit `automatic irrigation esp 32.ino` lines 88-89:
+Search for `const char* ssid` in the .ino file and update:
 
 - [ ] SSID matches your WiFi name exactly (case-sensitive)
 - [ ] Password is correct
 - [ ] Using 2.4GHz network (ESP32 doesn't support 5GHz)
+
+```cpp
+// Find these lines (search for "const char* ssid"):
+const char* ssid = "YOUR_EXACT_WIFI_NAME";      // Check case
+const char* password = "YOUR_EXACT_PASSWORD";    // Check special chars
+```
 
 ---
 
@@ -56,7 +62,7 @@ Look for these messages in order:
 - [ ] SPIFFS mounted successfully.
 - [ ] Files in SPIFFS:
 - [ ] Loading config from SPIFFS...
-- [ ] config.json not found. Using default settings. (expected on first boot)
+- [ ] Configuration loaded successfully: (or "config.json not found" on first boot)
 - [ ] Connecting to WiFi: [YOUR_SSID]
 - [ ] WiFi connected!
 - [ ] IP address: 192.168.X.XXX
@@ -141,7 +147,7 @@ Type: `S0:1200`
 
 ### Test 3: Config Upload
 
-**Step 1**: Edit `config.json` to test values:
+**Step 1**: Create/edit `config.json` with test values:
 ```json
 {
   "CALIBRATION_DRY": 3600,
@@ -151,7 +157,12 @@ Type: `S0:1200`
   "LEAK_THRESHOLD_PERCENT": 95,
   "ADC_SAMPLES": 10,
   "MUX_SETTLE_TIME_US": 1000,
-  "ADC_SAMPLE_DELAY_MS": 2
+  "ADC_SAMPLE_DELAY_MS": 2,
+  "CHECK_INTERVAL_MS": 30000,
+  "MIN_PUMP_ON_TIME_MS": 60000,
+  "MAX_PUMP_ON_TIME_MS": 1800000,
+  "POST_IRRIGATION_WAIT_TIME_MS": 3600000,
+  "IRRIGATING_CHECK_INTERVAL_MS": 5000
 }
 ```
 
@@ -176,10 +187,23 @@ Type: `S0:1200`
 - [ ] After reboot, Serial Monitor shows loaded config
 - [ ] New threshold values are used
 
-### Test 4: WiFi Resilience
+### Test 4: Timing Validation
+Upload config with invalid timing:
+```json
+{
+  "CHECK_INTERVAL_MS": 100,
+  "MIN_PUMP_ON_TIME_MS": 7200000,
+  "MAX_PUMP_ON_TIME_MS": 3600000
+}
+```
+
+- [ ] Serial Monitor shows WARNING messages
+- [ ] System uses safe default values instead
+
+### Test 5: WiFi Resilience
 - [ ] Unplug router / disable WiFi
 - [ ] Serial Monitor shows system continues running
-- [ ] Sensor readings still print every minute
+- [ ] Sensor readings still print periodically
 - [ ] State machine continues operating
 - [ ] Dashboard becomes inaccessible (expected)
 - [ ] Re-enable WiFi
@@ -210,15 +234,23 @@ In Serial Monitor, check boot messages:
 
 ---
 
+## Performance Baseline Reference
+
+| Metric | Expected Value | Notes |
+|--------|---------------|-------|
+| Dashboard refresh | 3 seconds | JavaScript setInterval |
+| Dashboard load time | < 3 seconds | Network dependent |
+| Config upload time | < 2 seconds | File size dependent |
+| Free heap memory | > 100KB | ESP32 has ~320KB total |
+| SPIFFS free space | > 10KB | For config.json storage |
+
+---
+
 ## Troubleshooting Quick Fixes
 
 ### ❌ WiFi Won't Connect
-```cpp
-// Change these in code:
-const char* ssid = "YOUR_EXACT_WIFI_NAME";      // Check case
-const char* password = "YOUR_EXACT_PASSWORD";    // Check special chars
-```
-Re-upload code.
+Search for `const char* ssid` in code and verify credentials match exactly.
+Re-upload code after changes.
 
 ### ❌ SPIFFS Mount Failed
 1. Tools → Erase Flash → "All Flash Contents"
@@ -240,7 +272,7 @@ error: 'StaticJsonDocument' was not declared
 ### ❌ Config Upload Does Nothing
 1. File MUST be named `config.json` exactly
 2. Validate JSON at jsonlint.com
-3. File must be < 1KB
+3. File must be < 2KB
 4. Check Serial Monitor for parse errors
 
 ---
@@ -253,6 +285,7 @@ Your Phase 4 is **fully operational** if:
 - ✅ Dashboard loads and displays sensors
 - ✅ State changes reflect in real-time
 - ✅ Config upload works and persists after reboot
+- ✅ Timing validation catches invalid values
 - ✅ System continues running if WiFi drops
 - ✅ Reports trigger via web buttons
 - ✅ No error messages in Serial Monitor
@@ -263,9 +296,10 @@ Your Phase 4 is **fully operational** if:
 
 1. **Calibration**: Measure your actual sensors in air/water
 2. **Threshold Tuning**: Adjust DRY/WET based on soil type
-3. **Production Deployment**: Install in field
-4. **Monitoring**: Watch for 24-48 hours
-5. **Optimization**: Fine-tune based on real data
+3. **Timing Tuning**: Adjust intervals based on your needs
+4. **Production Deployment**: Install in field
+5. **Monitoring**: Watch for 24-48 hours
+6. **Optimization**: Fine-tune based on real data
 
 ---
 

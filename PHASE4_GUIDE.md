@@ -29,19 +29,27 @@ Your ESP32 irrigation system now has a **full web interface** with:
 
 ## 🚀 Quick Start
 
-### Step 1: Configure WiFi Credentials
+### Step 1: Board Configuration (Arduino IDE)
 
-Open automatic irrigation esp 32.ino and edit lines 88-89:
+Go to **Tools** menu and configure:
+- **Board**: ESP32 Dev Module (or your specific ESP32 board)
+- **Upload Speed**: 921600 (use 115200 if upload fails)
+- **Flash Frequency**: 80MHz
+- **Flash Mode**: QIO
+- **Flash Size**: 4MB or larger
+- **Partition Scheme**: "Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)"
+- **Port**: Select your ESP32's COM/USB port
+
+### Step 2: Configure WiFi Credentials
+
+Open `automatic irrigation esp 32.ino` and search for `const char* ssid`:
 
 ```cpp
 const char* ssid = "YOUR_WIFI_NAME";     // ← Change this
 const char* password = "YOUR_PASSWORD";   // ← Change this
 ```
 
-### Step 2: Enable SPIFFS in Arduino IDE
-
-1. Go to **Tools → Partition Scheme**
-2. Select: **"Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)"**
+> **Note:** WiFi network must be 2.4GHz (ESP32 doesn't support 5GHz)
 
 ### Step 3: Upload the Code
 
@@ -95,6 +103,8 @@ Access dashboard at: http://192.168.1.XXX
 
 ### config.json Format
 
+The system supports **13 configurable parameters**:
+
 ```json
 {
   "CALIBRATION_DRY": 3500,
@@ -104,11 +114,18 @@ Access dashboard at: http://192.168.1.XXX
   "LEAK_THRESHOLD_PERCENT": 98,
   "ADC_SAMPLES": 5,
   "MUX_SETTLE_TIME_US": 800,
-  "ADC_SAMPLE_DELAY_MS": 1
+  "ADC_SAMPLE_DELAY_MS": 1,
+  "CHECK_INTERVAL_MS": 60000,
+  "MIN_PUMP_ON_TIME_MS": 300000,
+  "MAX_PUMP_ON_TIME_MS": 3600000,
+  "POST_IRRIGATION_WAIT_TIME_MS": 14400000,
+  "IRRIGATING_CHECK_INTERVAL_MS": 10000
 }
 ```
 
-### Parameter Descriptions:
+### Parameter Descriptions
+
+#### Calibration & Threshold Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -121,13 +138,44 @@ Access dashboard at: http://192.168.1.XXX
 | MUX_SETTLE_TIME_US | 800 | Microseconds to wait after MUX channel switch |
 | ADC_SAMPLE_DELAY_MS | 1 | Milliseconds between ADC samples |
 
+#### Timing Parameters
+
+| Parameter | Default | Human-Readable | Description |
+|-----------|---------|----------------|-------------|
+| CHECK_INTERVAL_MS | 60000 | 1 minute | How often to check sensors in MONITORING state |
+| MIN_PUMP_ON_TIME_MS | 300000 | 5 minutes | Minimum pump run time before checking if field is wet |
+| MAX_PUMP_ON_TIME_MS | 3600000 | 1 hour | Maximum pump run time before triggering FAULT state |
+| POST_IRRIGATION_WAIT_TIME_MS | 14400000 | 4 hours | Cooldown period after irrigation before next check |
+| IRRIGATING_CHECK_INTERVAL_MS | 10000 | 10 seconds | How often to check wetness while pump is running |
+
+### Timing Configuration Examples
+
+**For faster testing (shorter cycles):**
+```json
+{
+  "CHECK_INTERVAL_MS": 30000,
+  "MIN_PUMP_ON_TIME_MS": 60000,
+  "MAX_PUMP_ON_TIME_MS": 300000,
+  "POST_IRRIGATION_WAIT_TIME_MS": 600000,
+  "IRRIGATING_CHECK_INTERVAL_MS": 5000
+}
+```
+
+**For water-sensitive plants (longer soak time):**
+```json
+{
+  "MIN_PUMP_ON_TIME_MS": 600000,
+  "POST_IRRIGATION_WAIT_TIME_MS": 21600000
+}
+```
+
 ---
 
-## 🐛 Troubleshooting
+## 🛠 Troubleshooting
 
 ### WiFi Won't Connect
 **Solutions**:
-1. Check SSID and password spelling
+1. Check SSID and password spelling (case-sensitive)
 2. Ensure 2.4GHz network (ESP32 doesn't support 5GHz)
 3. Move ESP32 closer to router
 
@@ -145,13 +193,29 @@ Access dashboard at: http://192.168.1.XXX
 2. Verify ESP32 is on same network
 3. Try accessing /data endpoint directly: http://[IP]/data
 
+### Config Upload Fails
+**Solutions**:
+1. File MUST be named exactly `config.json`
+2. Validate JSON syntax at jsonlint.com
+3. File must be < 2KB
+4. Check Serial Monitor for parse errors
+
 ---
 
 ## 📊 Performance
 
 - Dashboard auto-refreshes every **3 seconds**
-- Sensor readings update every **1 minute**
+- Sensor readings update based on **CHECK_INTERVAL_MS** (default: 1 minute)
 - WebServer handles **1-2 concurrent connections**
+
+---
+
+## 📁 Related Documentation
+
+- **QUICK_REFERENCE.md** - Quick reference card for daily use
+- **TEST_CHECKLIST.md** - Verification checklist after setup
+- **CHANGES_SUMMARY.md** - Technical details of Phase 4 changes
+- **ALL_IMPROVEMENTS_COMPLETE.md** - Complete list of all improvements
 
 ---
 
