@@ -15,6 +15,10 @@
 
 // --- 0. INCLUDES ---
 #include <Preferences.h> // For saving data to flash
+#include <WiFi.h>        // For connecting to WiFi
+#include <WebServer.h>   // For the web server
+#include <ArduinoJson.h> // For sending data to the page
+#include <SPIFFS.h>      // For reading/writing config.json
 
 // --- 1. PIN DEFINITIONS (ESP32 GPIO) ---
 const int RELAY_PIN = 23;
@@ -31,25 +35,27 @@ const unsigned long MILLIS_PER_DAY    = 86400000UL;
 const unsigned long MILLIS_PER_30_DAYS = 2592000000UL;
 
 // --- 2. CRITICAL SETTINGS & THRESHOLDS ---
-const int CALIBRATION_DRY = 3500; // 0% moisture (in air)
-const int CALIBRATION_WET = 1200; // 100% moisture (in water)
-const int DRY_THRESHOLD = 3000; // Turn ON when a cluster is *ABOVE* this
-const int WET_THRESHOLD = 1500; // Turn OFF when ALL sensors are *BELOW* this
-const int LEAK_THRESHOLD_PERCENT = 98; // % for "super wet" leak check
-const int ADC_SAMPLES = 5; // Number of ADC samples for de-noising
-const int MUX_SETTLE_TIME_US = 800; // (microseconds)
-const int ADC_SAMPLE_DELAY_MS = 1; // (milliseconds)
+// These are DEFAULT values. They can be overridden by config.json from SPIFFS.
+int CALIBRATION_DRY = 3500; // 0% moisture (in air)
+int CALIBRATION_WET = 1200; // 100% moisture (in water)
+int DRY_THRESHOLD = 3000; // Turn ON when a cluster is *ABOVE* this
+int WET_THRESHOLD = 1500; // Turn OFF when ALL sensors are *BELOW* this
+int LEAK_THRESHOLD_PERCENT = 98; // % for "super wet" leak check
+int ADC_SAMPLES = 5; // Number of ADC samples for de-noising
+int MUX_SETTLE_TIME_US = 800; // (microseconds)
+int ADC_SAMPLE_DELAY_MS = 1; // (milliseconds)
 
-// --- Compile-time safety checks ---
-static_assert(WET_THRESHOLD < DRY_THRESHOLD, "WET_THRESHOLD must be less than DRY_THRESHOLD");
-static_assert(ADC_SAMPLES > 0, "ADC_SAMPLES must be at least 1");
+// --- Compile-time safety checks (commented out since thresholds are now mutable) ---
+// Note: Runtime validation will happen in loadConfigFromSPIFFS()
+// static_assert(WET_THRESHOLD < DRY_THRESHOLD, "WET_THRESHOLD must be less than DRY_THRESHOLD");
+// static_assert(ADC_SAMPLES > 0, "ADC_SAMPLES must be at least 1");
 
 // --- TIMING ---
-const unsigned long CHECK_INTERVAL_MS = 1 * MILLIS_PER_MINUTE;
-const unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE;
-const unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR;
-const unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR;
-const unsigned long IRRIGATING_CHECK_INTERVAL_MS = 10 * MILLIS_PER_SECOND;
+unsigned long CHECK_INTERVAL_MS = 1 * MILLIS_PER_MINUTE;
+unsigned long MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE;
+unsigned long MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR;
+unsigned long POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR;
+unsigned long IRRIGATING_CHECK_INTERVAL_MS = 10 * MILLIS_PER_SECOND;
 const unsigned long FAULT_PRINT_INTERVAL_MS = 5 * MILLIS_PER_SECOND;
 
 // --- ALERTS & REPORTING ---
@@ -82,6 +88,11 @@ SystemState currentState = MONITORING;
 const int NUM_SENSORS = 8;
 SensorNode sensorMap[NUM_SENSORS];
 static_assert(NUM_SENSORS == 8, "NUM_SENSORS is 8, but array sizes or loops may be hardcoded. Update all arrays.");
+
+// --- NEW: WiFi & Web Server ---
+WebServer server(80); // Create the server object on port 80
+const char* ssid = "Airtel_2 floor"; // Edit to match your WiFi
+const char* password = "10122004";    // Edit to match your WiFi
 
 // Per-State Timers
 unsigned long monTick=0, irrTick=0, waitTick=0, faultTick=0;
@@ -121,13 +132,34 @@ int monthlyReportCount = 0;
 // Simulation Variable
 int simulatedValues[NUM_SENSORS];
 
+// File upload variable (global handle for chunked uploads)
+File uploadFile;
+
 // --- Forward Declarations ---
 void forcePumpOff();
+void setupWiFi();
+void setupSPIFFS();
+void loadConfigFromSPIFFS();
+void createDefaultConfig();
+void handleRoot();
+void handleData();
+void handleSerialCommand();
+void handleUpload();
+void handleFileUpload();
 
 // --- 5. THE setup() FUNCTION ---
 void setup() {
   Serial.begin(115200);
   Serial.println("ESP32 Irrigation (Refactored) Initializing...");
+
+  // --- NEW: Initialize SPIFFS first (before WiFi) ---
+  setupSPIFFS();
+
+  // --- NEW: Load configuration from SPIFFS ---
+  loadConfigFromSPIFFS();
+
+  // --- NEW: Connect to WiFi ---
+  setupWiFi();
 
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(MUX_S0_PIN, OUTPUT);
@@ -176,12 +208,32 @@ void setup() {
   dailyCheckTime = millis();
   monthlyCheckTime = millis();
 
+  // --- NEW: Define Server Routes (only if WiFi connected) ---
+  if (WiFi.status() == WL_CONNECTED) {
+    server.on("/", HTTP_GET, handleRoot);     // Send the HTML page
+    server.on("/data", HTTP_GET, handleData); // Send the JSON data
+    server.on("/serial", HTTP_GET, handleSerialCommand); // Handle web commands
+    server.on("/upload", HTTP_POST, handleUpload, handleFileUpload); // Handle config upload
+
+    server.begin();
+    Serial.println("Web Server started.");
+    Serial.print("Access dashboard at: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Web Server not started (no WiFi connection).");
+  }
+
   // Print CSV header once on boot
   Serial.println("CSV_HEADER,dayIndex,millis,cycles,totalLiters,avgWatering,avgWet,avgDry,avgField%");
 }
 
 // --- 6. THE loop() FUNCTION ---
 void loop() {
+  // --- NEW: Handle web requests if WiFi is on ---
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
+
   checkSerialCommands();
 
   switch (currentState) {
@@ -214,6 +266,453 @@ void loop() {
 
 // --- 7. ALL OTHER CUSTOM FUNCTIONS ---
 
+// ============================================================
+// PHASE 4: WiFi, SPIFFS, and Web Server Functions
+// ============================================================
+
+/**
+ * @brief Connects to WiFi with timeout.
+ */
+void setupWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+  int connectTries = 0;
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    connectTries++;
+    if (connectTries > 30) { // 15-second timeout
+      Serial.println("\nFailed to connect to WiFi after 15s.");
+      Serial.println("Continuing WITHOUT WiFi. Irrigation logic will run.");
+      return; // Exit gracefully - don't halt
+    }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+/**
+ * @brief Initializes the SPIFFS filesystem.
+ */
+void setupSPIFFS() {
+  Serial.println("Initializing SPIFFS...");
+  if (!SPIFFS.begin(true)) { // 'true' = format if mount fails
+    Serial.println("ERROR: SPIFFS mount failed!");
+    Serial.println("Continuing with default settings.");
+    return;
+  }
+  Serial.println("SPIFFS mounted successfully.");
+
+  // Create default config if it doesn't exist
+  if (!SPIFFS.exists("/config.json")) {
+    Serial.println("config.json not found. Creating default...");
+    createDefaultConfig();
+  }
+
+  // List files (for debugging)
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  Serial.println("Files in SPIFFS:");
+  while (file) {
+    Serial.print("  - ");
+    Serial.print(file.name());
+    Serial.print(" (");
+    Serial.print(file.size());
+    Serial.println(" bytes)");
+    file.close();  // Close file handle before getting next
+    file = root.openNextFile();
+  }
+  root.close();  // Close root directory handle
+}
+
+/**
+ * @brief Loads configuration from /config.json in SPIFFS.
+ * If file doesn't exist or is invalid, uses default values.
+ */
+void loadConfigFromSPIFFS() {
+  Serial.println("Loading config from SPIFFS...");
+
+  if (!SPIFFS.exists("/config.json")) {
+    Serial.println("config.json not found. Using default settings.");
+    return;
+  }
+
+  File configFile = SPIFFS.open("/config.json", "r");
+  if (!configFile) {
+    Serial.println("ERROR: Failed to open config.json");
+    return;
+  }
+
+  size_t size = configFile.size();
+  if (size > 3072) {
+    Serial.println("ERROR: config.json is too large!");
+    configFile.close();
+    return;
+  }
+
+  // Allocate buffer and read file
+  std::unique_ptr<char[]> buf(new char[size]);
+  configFile.readBytes(buf.get(), size);
+  configFile.close();
+
+  // Parse JSON
+  StaticJsonDocument<4096> doc;
+  DeserializationError error = deserializeJson(doc, buf.get());
+
+  if (error) {
+    Serial.print("ERROR: Failed to parse config.json: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  // Load threshold values (with defaults if keys don't exist)
+  if (doc.containsKey("CALIBRATION_DRY")) CALIBRATION_DRY = doc["CALIBRATION_DRY"];
+  if (doc.containsKey("CALIBRATION_WET")) CALIBRATION_WET = doc["CALIBRATION_WET"];
+  if (doc.containsKey("DRY_THRESHOLD")) DRY_THRESHOLD = doc["DRY_THRESHOLD"];
+  if (doc.containsKey("WET_THRESHOLD")) WET_THRESHOLD = doc["WET_THRESHOLD"];
+  if (doc.containsKey("LEAK_THRESHOLD_PERCENT")) LEAK_THRESHOLD_PERCENT = doc["LEAK_THRESHOLD_PERCENT"];
+  if (doc.containsKey("ADC_SAMPLES")) ADC_SAMPLES = max(1, (int)doc["ADC_SAMPLES"]);
+  if (doc.containsKey("MUX_SETTLE_TIME_US")) MUX_SETTLE_TIME_US = doc["MUX_SETTLE_TIME_US"];
+  if (doc.containsKey("ADC_SAMPLE_DELAY_MS")) ADC_SAMPLE_DELAY_MS = doc["ADC_SAMPLE_DELAY_MS"];
+
+  // Load timing parameters if present
+  if (doc.containsKey("CHECK_INTERVAL_MS")) CHECK_INTERVAL_MS = doc["CHECK_INTERVAL_MS"];
+  if (doc.containsKey("MIN_PUMP_ON_TIME_MS")) MIN_PUMP_ON_TIME_MS = doc["MIN_PUMP_ON_TIME_MS"];
+  if (doc.containsKey("MAX_PUMP_ON_TIME_MS")) MAX_PUMP_ON_TIME_MS = doc["MAX_PUMP_ON_TIME_MS"];
+  if (doc.containsKey("POST_IRRIGATION_WAIT_TIME_MS")) POST_IRRIGATION_WAIT_TIME_MS = doc["POST_IRRIGATION_WAIT_TIME_MS"];
+  if (doc.containsKey("IRRIGATING_CHECK_INTERVAL_MS")) IRRIGATING_CHECK_INTERVAL_MS = doc["IRRIGATING_CHECK_INTERVAL_MS"];
+
+  // Runtime validation for thresholds
+  if (WET_THRESHOLD >= DRY_THRESHOLD) {
+    Serial.println("WARNING: WET_THRESHOLD >= DRY_THRESHOLD in config! Using defaults.");
+    WET_THRESHOLD = 1500;
+    DRY_THRESHOLD = 3000;
+  }
+
+  // Runtime validation for timing parameters
+  if (CHECK_INTERVAL_MS < 1000) {
+    Serial.println("WARNING: CHECK_INTERVAL_MS < 1s! Using 60000ms.");
+    CHECK_INTERVAL_MS = 60000;
+  }
+  if (IRRIGATING_CHECK_INTERVAL_MS < 1000) {
+    Serial.println("WARNING: IRRIGATING_CHECK_INTERVAL_MS < 1s! Using 10000ms.");
+    IRRIGATING_CHECK_INTERVAL_MS = 10000;
+  }
+  if (MIN_PUMP_ON_TIME_MS >= MAX_PUMP_ON_TIME_MS) {
+    Serial.println("WARNING: MIN_PUMP >= MAX_PUMP time! Using defaults.");
+    MIN_PUMP_ON_TIME_MS = 5 * MILLIS_PER_MINUTE;
+    MAX_PUMP_ON_TIME_MS = 1 * MILLIS_PER_HOUR;
+  }
+  if (POST_IRRIGATION_WAIT_TIME_MS < MILLIS_PER_MINUTE) {
+    Serial.println("WARNING: POST_IRRIGATION_WAIT < 1min! Using 4 hours.");
+    POST_IRRIGATION_WAIT_TIME_MS = 4 * MILLIS_PER_HOUR;
+  }
+
+  Serial.println("Configuration loaded successfully:");
+  Serial.print("  DRY_THRESHOLD: "); Serial.println(DRY_THRESHOLD);
+  Serial.print("  WET_THRESHOLD: "); Serial.println(WET_THRESHOLD);
+  Serial.print("  CALIBRATION_DRY: "); Serial.println(CALIBRATION_DRY);
+  Serial.print("  CALIBRATION_WET: "); Serial.println(CALIBRATION_WET);
+}
+
+/**
+ * @brief Creates a default config.json file if it doesn't exist
+ */
+void createDefaultConfig() {
+  const char* defConfig = R"({
+  "CALIBRATION_DRY": 3500,
+  "CALIBRATION_WET": 1200,
+  "DRY_THRESHOLD": 3000,
+  "WET_THRESHOLD": 1500,
+  "LEAK_THRESHOLD_PERCENT": 98,
+  "ADC_SAMPLES": 5,
+  "MUX_SETTLE_TIME_US": 800,
+  "ADC_SAMPLE_DELAY_MS": 1,
+  "CHECK_INTERVAL_MS": 60000,
+  "MIN_PUMP_ON_TIME_MS": 300000,
+  "MAX_PUMP_ON_TIME_MS": 3600000,
+  "POST_IRRIGATION_WAIT_TIME_MS": 14400000,
+  "IRRIGATING_CHECK_INTERVAL_MS": 10000
+})";
+
+  File file = SPIFFS.open("/config.json", "w");
+  if (file) {
+    file.print(defConfig);
+    file.close();
+    Serial.println("Default config.json created successfully.");
+  } else {
+    Serial.println("ERROR: Failed to create default config.json");
+  }
+}
+
+/**
+ * @brief Handles requests to the main web page (the root '/')
+ */
+void handleRoot() {
+  server.send_P(200, "text/html", HTML_PAGE);
+}
+
+/**
+ * @brief Handles requests for live data (at '/data')
+ */
+void handleData() {
+  StaticJsonDocument<2048> doc;
+
+  // Add the current system state
+  switch(currentState) {
+    case MONITORING: doc["state"] = "MONITORING"; break;
+    case IRRIGATING: doc["state"] = "IRRIGATING"; break;
+    case WAITING:    doc["state"] = "WAITING"; break;
+    case SYSTEM_FAULT: doc["state"] = "SYSTEM_FAULT"; break;
+  }
+
+  // --- FIX: Add IP address ---
+  doc["ip"] = WiFi.localIP().toString();
+
+  // Create a JSON array for the sensors
+  JsonArray sensors = doc.createNestedArray("sensors");
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    JsonObject s = sensors.createNestedObject();
+    s["channel"] = sensorMap[i].channel;
+    s["x"] = sensorMap[i].x;
+    s["y"] = sensorMap[i].y;
+    s["val"] = sensorMap[i].moistureValue;
+    s["pct"] = sensorMap[i].moisturePercentage;
+    s["isDry"] = sensorMap[i].isDry;
+  }
+
+  // Serialize the JSON to a string
+  String output;
+  serializeJson(doc, output);
+
+  server.send(200, "application/json", output);
+}
+
+/**
+ * @brief Handles serial commands sent from the web page.
+ */
+void handleSerialCommand() {
+  if (server.hasArg("cmd")) {
+    String cmd = server.arg("cmd");
+    Serial.print("Web command received: ");
+    Serial.println(cmd);
+
+    // Pass the command to our existing serial handler
+    if (cmd == "REPORT") {
+      logMoistureAndMetricsReport();
+      logCsvDailySummary();
+    }
+    if (cmd == "MONTHLY_REPORT") logMonthlyReport();
+
+    server.send(200, "text/plain", "Command executed. Check Serial Monitor for output.");
+  } else {
+    server.send(400, "text/plain", "Missing 'cmd' parameter");
+  }
+}
+
+/**
+ * @brief Handles the completion of a file upload.
+ */
+void handleUpload() {
+  server.send(200, "text/plain", "Config uploaded successfully! ESP32 will reload config...");
+  delay(100); // Let response send
+  loadConfigFromSPIFFS(); // Reload the new config
+}
+
+/**
+ * @brief Handles the actual file upload data.
+ */
+void handleFileUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.print("Receiving file: ");
+    Serial.println(upload.filename);
+
+    // Validate filename
+    if (String(upload.filename) != "config.json") {
+      Serial.println("ERROR: Rejecting upload - filename must be config.json");
+      return;
+    }
+
+    // Remove old file and open new one
+    SPIFFS.remove("/config.json");
+    uploadFile = SPIFFS.open("/config.json", "w");
+    if (!uploadFile) {
+      Serial.println("ERROR: Failed to open file for writing!");
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    // Write chunk to global file handle
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END) {
+    // Close file and report completion
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.print("Upload complete: ");
+      Serial.print(upload.totalSize);
+      Serial.println(" bytes");
+    }
+  }
+}
+
+// --- HTML Page in PROGMEM (Flash Memory) ---
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <title>ESP32 Irrigation Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0 20px; background-color: #f4f4f4; }
+    h1 { color: #2c3e50; text-align: center; }
+    .container { max-width: 800px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+    .nav { text-align: center; margin-bottom: 20px; }
+    .btn { padding: 10px 20px; font-size: 1em; color: #fff; background-color: #3498db; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; margin: 5px; }
+    .btn-upload { background-color: #f39c12; }
+    #status { padding: 20px; margin-bottom: 20px; border-radius: 8px; font-weight: bold; font-size: 1.2em; text-align: center; }
+    #grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+    .sensor { padding: 15px; border-radius: 8px; background: #ecf0f1; border: 2px solid #bdc3c7; }
+    .sensor-title { font-weight: bold; }
+    .sensor-val { font-size: 1.5em; }
+    .sensor-pct { color: #7f8c8d; }
+    h2 { border-bottom: 2px solid #eee; padding-bottom: 5px; }
+  </style>
+</head>
+<body>
+  <h1>ESP32 Irrigation Control</h1>
+
+  <div class="container">
+    <div class="nav">
+      <button class="btn" onclick="showPage('report')">View Report</button>
+      <button class="btn btn-upload" onclick="showPage('upload')">Upload Config</button>
+    </div>
+
+    <div id="page-report">
+      <h2>Live Status</h2>
+      <div id="status">Loading...</div>
+      <div id="grid"></div>
+
+      <h2>Serial Reports</h2>
+      <button class="btn" onclick="sendCommand('REPORT')">Get Daily Report</button>
+      <button class="btn" onclick="sendCommand('MONTHLY_REPORT')">Get Monthly Report</button>
+      <pre id="serial-output" style="background-color: #333; color: #fff; padding: 10px; border-radius: 5px; max-height: 300px; overflow-y: auto;">Serial report output will appear here...</pre>
+    </div>
+
+    <div id="page-upload" style="display:none;">
+      <h2>Upload Configuration</h2>
+      <form id="upload-form" enctype="multipart/form-data" method="POST" action="/upload">
+        <label for="configFile">Select config.json:</label><br>
+        <input type="file" id="configFile" name="config" accept=".json"><br><br>
+        <input type="submit" value="Upload" class="btn">
+      </form>
+      <p id="upload-status" style="margin-top: 15px;"><i>Waiting for file...</i></p>
+    </div>
+  </div>
+
+  <script>
+    function showPage(pageId) {
+      document.getElementById('page-report').style.display = (pageId === 'report') ? 'block' : 'none';
+      document.getElementById('page-upload').style.display = (pageId === 'upload') ? 'block' : 'none';
+    }
+
+    function updateData() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          // Update Status
+          const statusDiv = document.getElementById('status');
+          statusDiv.innerHTML = 'System State: ' + data.state + ' | IP: ' + data.ip;
+          if (data.state === 'IRRIGATING') { statusDiv.style.background = '#2ecc71'; statusDiv.style.color = '#fff'; }
+          else if (data.state === 'SYSTEM_FAULT') { statusDiv.style.background = '#e74c3c'; statusDiv.style.color = '#fff'; }
+          else { statusDiv.style.background = '#ecf0f1'; statusDiv.style.color = '#2c3e50'; }
+
+          // Update Sensor Grid
+          const grid = document.getElementById('grid');
+          grid.innerHTML = '';
+          data.sensors.forEach(s => {
+            const div = document.createElement('div');
+            div.className = 'sensor';
+            div.innerHTML = `<span class="sensor-title">S-${s.channel} (${s.x},${s.y})</span><br>
+                           <span class="sensor-val">${s.pct}%</span><br>
+                           <span class="sensor-pct">(${s.val})</span>`;
+
+            if (s.isDry) { div.style.borderColor = '#e74c3c'; div.style.background = '#fbe9e7'; }
+            else if (s.pct > 80) { div.style.borderColor = '#2980b9'; div.style.background = '#eaf5fb'; }
+            else { div.style.borderColor = '#bdc3c7'; div.style.background = '#ecf0f1'; }
+            grid.appendChild(div);
+          });
+        })
+        .catch(error => console.error('Error fetching data:', error));
+    }
+
+    function sendCommand(cmd) {
+      fetch('/serial?cmd=' + cmd)
+        .then(response => response.text())
+        .then(text => {
+          document.getElementById('serial-output').textContent = text;
+        })
+        .catch(error => {
+          document.getElementById('serial-output').textContent = 'Error: ' + error;
+        });
+    }
+
+    // Initial display and auto-update
+    showPage('report');
+    updateData();
+    setInterval(updateData, 3000);
+
+    // Handle File Upload Form Submission
+    document.getElementById('upload-form').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const fileInput = document.getElementById('configFile');
+        const uploadStatus = document.getElementById('upload-status');
+
+        if (fileInput.files.length === 0) {
+            uploadStatus.textContent = 'Please select a file.';
+            return;
+        }
+
+        uploadStatus.textContent = 'Uploading...';
+
+        const file = fileInput.files[0];
+        if (file.name !== "config.json") {
+             uploadStatus.textContent = 'Error: File must be named config.json';
+             return;
+        }
+
+        const formData = new FormData();
+        formData.append('config', file);
+
+        fetch('/upload', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.text())
+        .then(text => {
+            uploadStatus.textContent = text;
+        })
+        .catch(error => {
+            uploadStatus.textContent = 'Upload Failed: ' + error;
+        });
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+// END OF PHASE 4 FUNCTIONS
+// ============================================================
+
 /**
  * @brief Central handler for all serial commands.
  */
@@ -227,6 +726,7 @@ void checkSerialCommands() {
     // Check for "STATE:" first to prevent collision with "S:"
     if (input.startsWith("STATE:")) {
       String newState = input.substring(6);
+      newState.trim();
       newState.toUpperCase();
       if (newState == "MONITORING") {
         currentState = MONITORING;
@@ -539,8 +1039,13 @@ void forcePumpOff() {
  * (Note: Higher ADC value = Drier soil, so the map() inverts the range)
  */
 int convertToPercentage(int rawValue) {
-  // Use (long) casts for type safety
-  int percentage = map((long)rawValue, (long)CALIBRATION_DRY, (long)CALIBRATION_WET, 0L, 100L);
+  // Clip input to valid calibration range first (prevents out-of-range mapping)
+  long clipped = rawValue;
+  if (clipped < CALIBRATION_WET) clipped = CALIBRATION_WET;
+  if (clipped > CALIBRATION_DRY) clipped = CALIBRATION_DRY;
+
+  // Map clipped value (Higher ADC = Drier, so invert)
+  int percentage = map(clipped, (long)CALIBRATION_DRY, (long)CALIBRATION_WET, 0L, 100L);
   return constrain(percentage, 0, 100);
 }
 
