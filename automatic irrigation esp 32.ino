@@ -1,16 +1,21 @@
 /*
  * ==========================================================
  * ESP32 ADVANCED IRRIGATION SYSTEM
- * FINAL REFACTORED CODE (as of 2025-11-06)
+ * Version 4.2 - Spatial Topology Update
  *
- * This code includes all features from Phase 1, 2, and 3,
- * and all bug fixes and robustness features from the code reviews.
+ * Features:
+ * - 9-sensor 3x3 grid layout
+ * - BFS-based moisture topology analysis
+ * - Visual moisture heatmap on web dashboard
+ * - Gradient detection for drainage patterns
+ * - Cluster-based irrigation triggering
  *
- * ... (Previous fixes)
- * - FIX 13 (BUG): Added missing prefs.begin()/end() calls for all
- * flash memory writes, preventing data save failures.
- * - FIX 14 (BUG): Added missing prefs.end() in setup() after loading.
- * ... (All other features/fixes included)
+ * Previous Phases (1-4):
+ * - Spatial sensor analysis with BFS clustering
+ * - WiFi connectivity and web dashboard
+ * - Dynamic configuration via config.json
+ * - Comprehensive diagnostics and reporting
+ * ==========================================================
  */
 
 // --- 0. INCLUDES ---
@@ -22,10 +27,15 @@
 
 // --- 1. PIN DEFINITIONS (ESP32 GPIO) ---
 const int RELAY_PIN = 23;
-const int MUX_COMMON_PIN = 34;
+
+// Multiplexer Control Pins (Output Capable GPIOs)
 const int MUX_S0_PIN = 19;
 const int MUX_S1_PIN = 18;
-const int MUX_S2_PIN = 5;
+const int MUX_S2_PIN = 21;  // Changed from GPIO 5 to GPIO 21
+
+// Analog Reading Pins (ADC1 - Safe for WiFi)
+const int MUX_COMMON_PIN = 34;  // Reads sensors 0-7 via multiplexer
+const int SENSOR_9_PIN = 35;    // Reads sensor 8 directly
 
 // --- Time conversion constants ---
 const unsigned long MILLIS_PER_SECOND = 1000UL;
@@ -85,9 +95,9 @@ struct SensorNode {
 // --- 4. GLOBAL VARIABLES ---
 Preferences prefs; // For saving data
 SystemState currentState = MONITORING;
-const int NUM_SENSORS = 8;
+const int NUM_SENSORS = 9;
 SensorNode sensorMap[NUM_SENSORS];
-static_assert(NUM_SENSORS == 8, "NUM_SENSORS is 8, but array sizes or loops may be hardcoded. Update all arrays.");
+static_assert(NUM_SENSORS == 9, "NUM_SENSORS is 9, but array sizes or loops may be hardcoded. Update all arrays.");
 
 // --- NEW: WiFi & Web Server ---
 WebServer server(80); // Create the server object on port 80
@@ -134,6 +144,7 @@ int simulatedValues[NUM_SENSORS];
 
 // File upload variable (global handle for chunked uploads)
 File uploadFile;
+bool uploadSuccess = false;  // Track upload status
 
 // --- Forward Declarations ---
 void forcePumpOff();
@@ -146,6 +157,9 @@ void handleData();
 void handleSerialCommand();
 void handleUpload();
 void handleFileUpload();
+
+// Forward declaration for HTML page stored in PROGMEM
+extern const char HTML_PAGE[] PROGMEM;
 
 // --- 5. THE setup() FUNCTION ---
 void setup() {
@@ -170,6 +184,7 @@ void setup() {
   // Set ADC attenuation for better 0-3.3V range
   #ifdef ARDUINO_ARCH_ESP32
     analogSetPinAttenuation(MUX_COMMON_PIN, ADC_11db); // ~3.3V full scale
+    analogSetPinAttenuation(SENSOR_9_PIN, ADC_11db);   // ~3.3V full scale for sensor 8
   #endif
 
   initializeSensorMap();
@@ -355,14 +370,15 @@ void loadConfigFromSPIFFS() {
     return;
   }
 
-  // Allocate buffer and read file
-  std::unique_ptr<char[]> buf(new char[size]);
+  // Allocate buffer and read file (with null terminator)
+  std::unique_ptr<char[]> buf(new char[size + 1]);
   configFile.readBytes(buf.get(), size);
+  buf[size] = '\0';  // Null-terminate the buffer
   configFile.close();
 
-  // Parse JSON
+  // Parse JSON (pass length for extra safety)
   StaticJsonDocument<4096> doc;
-  DeserializationError error = deserializeJson(doc, buf.get());
+  DeserializationError error = deserializeJson(doc, buf.get(), size);
 
   if (error) {
     Serial.print("ERROR: Failed to parse config.json: ");
@@ -520,9 +536,14 @@ void handleSerialCommand() {
  * @brief Handles the completion of a file upload.
  */
 void handleUpload() {
-  server.send(200, "text/plain", "Config uploaded successfully! ESP32 will reload config...");
-  delay(100); // Let response send
-  loadConfigFromSPIFFS(); // Reload the new config
+  if (uploadSuccess) {
+    server.send(200, "text/plain", "Config uploaded successfully! Reloading...");
+    delay(100);
+    loadConfigFromSPIFFS();
+  } else {
+    server.send(400, "text/plain", "Upload failed! File must be named config.json");
+  }
+  uploadSuccess = false;  // Reset for next upload
 }
 
 /**
@@ -532,6 +553,7 @@ void handleFileUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    uploadSuccess = false;  // Reset flag at start
     Serial.print("Receiving file: ");
     Serial.println(upload.filename);
 
@@ -558,6 +580,7 @@ void handleFileUpload() {
     // Close file and report completion
     if (uploadFile) {
       uploadFile.close();
+      uploadSuccess = true;  // Mark success only if file handle was valid
       Serial.print("Upload complete: ");
       Serial.print(upload.totalSize);
       Serial.println(" bytes");
@@ -572,138 +595,328 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
   <title>ESP32 Irrigation Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { font-family: Arial, sans-serif; margin: 0; padding: 0 20px; background-color: #f4f4f4; }
-    h1 { color: #2c3e50; text-align: center; }
-    .container { max-width: 800px; margin: 20px auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-    .nav { text-align: center; margin-bottom: 20px; }
-    .btn { padding: 10px 20px; font-size: 1em; color: #fff; background-color: #3498db; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; margin: 5px; }
-    .btn-upload { background-color: #f39c12; }
-    #status { padding: 20px; margin-bottom: 20px; border-radius: 8px; font-weight: bold; font-size: 1.2em; text-align: center; }
-    #grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
-    .sensor { padding: 15px; border-radius: 8px; background: #ecf0f1; border: 2px solid #bdc3c7; }
-    .sensor-title { font-weight: bold; }
-    .sensor-val { font-size: 1.5em; }
-    .sensor-pct { color: #7f8c8d; }
-    h2 { border-bottom: 2px solid #eee; padding-bottom: 5px; }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; color: #eee; }
+    h1 { color: #4fc3f7; text-align: center; margin-bottom: 10px; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 20px; }
+    .container { max-width: 900px; margin: 0 auto; }
+
+    /* Navigation Buttons */
+    .nav { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+    .nav-btn { padding: 12px 24px; font-size: 1em; color: #fff; background: #2196F3; border: none; border-radius: 25px; cursor: pointer; transition: all 0.3s; }
+    .nav-btn:hover { background: #1976D2; transform: translateY(-2px); }
+    .nav-btn.active { background: #0d47a1; box-shadow: 0 0 15px rgba(33,150,243,0.5); }
+    .nav-btn.upload { background: #ff9800; }
+    .nav-btn.upload:hover { background: #f57c00; }
+    .nav-btn.upload.active { background: #e65100; box-shadow: 0 0 15px rgba(255,152,0,0.5); }
+    .nav-btn.heatmap { background: #00bcd4; }
+    .nav-btn.heatmap:hover { background: #00acc1; }
+    .nav-btn.heatmap.active { background: #00838f; box-shadow: 0 0 15px rgba(0,188,212,0.5); }
+
+    /* Status Bar */
+    #status { padding: 15px 20px; margin-bottom: 20px; border-radius: 10px; font-weight: bold; font-size: 1.1em; text-align: center; background: #263238; border: 2px solid #37474f; }
+    #status.irrigating { background: linear-gradient(90deg, #1b5e20, #2e7d32); border-color: #4caf50; }
+    #status.fault { background: linear-gradient(90deg, #b71c1c, #c62828); border-color: #f44336; }
+
+    /* Sensor Grid - Live View */
+    #grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
+    .sensor { padding: 15px; border-radius: 12px; background: #263238; border: 3px solid #455a64; text-align: center; transition: all 0.3s; }
+    .sensor:hover { transform: scale(1.02); }
+    .sensor-title { font-weight: bold; color: #90a4ae; font-size: 0.85em; }
+    .sensor-val { font-size: 2em; font-weight: bold; margin: 5px 0; }
+    .sensor-raw { color: #607d8b; font-size: 0.8em; }
+    .sensor.dry { border-color: #f44336; background: linear-gradient(135deg, #263238, #3e2723); }
+    .sensor.dry .sensor-val { color: #ff8a80; }
+    .sensor.wet { border-color: #2196F3; background: linear-gradient(135deg, #263238, #1a237e); }
+    .sensor.wet .sensor-val { color: #82b1ff; }
+
+    /* MOISTURE HEATMAP STYLES */
+    .heatmap-container { margin-bottom: 20px; }
+    .heatmap-title { text-align: center; color: #4fc3f7; margin-bottom: 15px; font-size: 1.2em; }
+    #heatmap { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; max-width: 400px; margin: 0 auto; aspect-ratio: 1; }
+    .heatmap-cell { border-radius: 8px; display: flex; flex-direction: column; justify-content: center; align-items: center; color: #fff; font-weight: bold; text-shadow: 1px 1px 2px rgba(0,0,0,0.7); transition: all 0.5s ease; position: relative; min-height: 100px; }
+    .heatmap-cell .pct { font-size: 1.8em; }
+    .heatmap-cell .label { font-size: 0.75em; opacity: 0.9; margin-top: 4px; }
+
+    /* Color Legend */
+    .legend { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 20px; padding: 15px; background: #263238; border-radius: 10px; }
+    .legend-bar { width: 200px; height: 20px; border-radius: 10px; background: linear-gradient(90deg, #e3f2fd 0%, #64b5f6 25%, #2196f3 50%, #1565c0 75%, #0d47a1 100%); }
+    .legend-labels { display: flex; justify-content: space-between; width: 200px; font-size: 0.8em; color: #90a4ae; margin-top: 5px; }
+
+    /* Field Orientation Indicator */
+    .field-indicator { text-align: center; color: #607d8b; font-size: 0.85em; margin: 10px 0; }
+    .field-indicator .arrow { font-size: 1.2em; }
+
+    /* Page Sections */
+    .page { display: none; }
+    .page.active { display: block; }
+
+    /* Report Buttons */
+    .report-btns { display: flex; gap: 10px; justify-content: center; margin-bottom: 15px; }
+    .btn { padding: 10px 20px; font-size: 0.95em; color: #fff; background: #455a64; border: none; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
+    .btn:hover { background: #546e7a; }
+
+    /* Upload Form */
+    .upload-box { background: #263238; padding: 30px; border-radius: 12px; text-align: center; }
+    .upload-box input[type="file"] { margin: 15px 0; }
+    #upload-status { margin-top: 15px; padding: 10px; border-radius: 8px; }
+
+    /* Stats Box */
+    .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 20px; }
+    .stat-box { background: #263238; padding: 15px; border-radius: 10px; text-align: center; }
+    .stat-box .value { font-size: 1.5em; color: #4fc3f7; font-weight: bold; }
+    .stat-box .label { color: #90a4ae; font-size: 0.85em; margin-top: 5px; }
   </style>
 </head>
 <body>
-  <h1>ESP32 Irrigation Control</h1>
+  <h1>🌱 ESP32 Smart Irrigation</h1>
+  <p class="subtitle">Moisture Topology System</p>
 
   <div class="container">
+    <!-- Navigation -->
     <div class="nav">
-      <button class="btn" onclick="showPage('report')">View Report</button>
-      <button class="btn btn-upload" onclick="showPage('upload')">Upload Config</button>
+      <button class="nav-btn active" onclick="showPage(this, 'status')">📊 Live Status</button>
+      <button class="nav-btn heatmap" onclick="showPage(this, 'heatmap')">🗺️ Moisture Map</button>
+      <button class="nav-btn upload" onclick="showPage(this, 'upload')">⚙️ Upload Config</button>
     </div>
 
-    <div id="page-report">
-      <h2>Live Status</h2>
-      <div id="status">Loading...</div>
+    <!-- Status Bar -->
+    <div id="status">Loading...</div>
+
+    <!-- PAGE 1: Live Status -->
+    <div id="page-status" class="page active">
+      <div class="field-indicator">
+        <span class="arrow">⬆️</span> Top of Field (North)
+      </div>
       <div id="grid"></div>
+      <div class="field-indicator">
+        <span class="arrow">⬇️</span> Bottom of Field (South)
+      </div>
 
-      <h2>Serial Reports</h2>
-      <button class="btn" onclick="sendCommand('REPORT')">Get Daily Report</button>
-      <button class="btn" onclick="sendCommand('MONTHLY_REPORT')">Get Monthly Report</button>
-      <pre id="serial-output" style="background-color: #333; color: #fff; padding: 10px; border-radius: 5px; max-height: 300px; overflow-y: auto;">Serial report output will appear here...</pre>
+      <div class="report-btns">
+        <button class="btn" onclick="sendCommand('REPORT')">📋 Daily Report</button>
+        <button class="btn" onclick="sendCommand('MONTHLY_REPORT')">📈 Monthly Report</button>
+      </div>
     </div>
 
-    <div id="page-upload" style="display:none;">
-      <h2>Upload Configuration</h2>
-      <form id="upload-form" enctype="multipart/form-data" method="POST" action="/upload">
-        <label for="configFile">Select config.json:</label><br>
-        <input type="file" id="configFile" name="config" accept=".json"><br><br>
-        <input type="submit" value="Upload" class="btn">
-      </form>
-      <p id="upload-status" style="margin-top: 15px;"><i>Waiting for file...</i></p>
+    <!-- PAGE 2: Moisture Heatmap -->
+    <div id="page-heatmap" class="page">
+      <div class="heatmap-container">
+        <div class="heatmap-title">🗺️ Field Moisture Topology</div>
+        <div class="field-indicator">
+          <span class="arrow">⬆️</span> Top of Field (North)
+        </div>
+        <div id="heatmap"></div>
+        <div class="field-indicator">
+          <span class="arrow">⬇️</span> Bottom of Field (South)
+        </div>
+
+        <!-- Color Legend -->
+        <div class="legend">
+          <span>Dry</span>
+          <div>
+            <div class="legend-bar"></div>
+            <div class="legend-labels">
+              <span>0%</span>
+              <span>50%</span>
+              <span>100%</span>
+            </div>
+          </div>
+          <span>Wet</span>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats">
+          <div class="stat-box">
+            <div class="value" id="stat-avg">--</div>
+            <div class="label">Average Moisture</div>
+          </div>
+          <div class="stat-box">
+            <div class="value" id="stat-min">--</div>
+            <div class="label">Driest Sensor</div>
+          </div>
+          <div class="stat-box">
+            <div class="value" id="stat-max">--</div>
+            <div class="label">Wettest Sensor</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAGE 3: Upload Config -->
+    <div id="page-upload" class="page">
+      <div class="upload-box">
+        <h2>📤 Upload Configuration</h2>
+        <p style="color:#90a4ae;">Upload a new config.json to change thresholds and timing.</p>
+        <form id="upload-form" enctype="multipart/form-data" method="POST" action="/upload">
+          <input type="file" id="configFile" name="config" accept=".json"><br>
+          <button type="submit" class="btn" style="background:#ff9800; margin-top:10px;">Upload Config</button>
+        </form>
+        <div id="upload-status"></div>
+      </div>
     </div>
   </div>
 
   <script>
-    function showPage(pageId) {
-      document.getElementById('page-report').style.display = (pageId === 'report') ? 'block' : 'none';
-      document.getElementById('page-upload').style.display = (pageId === 'upload') ? 'block' : 'none';
+    // Page Navigation
+    function showPage(btn, pageId) {
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('page-' + pageId).classList.add('active');
+      btn.classList.add('active');
     }
 
+    // Get moisture color (blue gradient)
+    function getMoistureColor(pct) {
+      // From light blue (dry) to dark blue (wet)
+      const colors = [
+        { pct: 0,   r: 227, g: 242, b: 253 },  // Very light blue (dry)
+        { pct: 25,  r: 100, g: 181, b: 246 },  // Light blue
+        { pct: 50,  r: 33,  g: 150, b: 243 },  // Medium blue
+        { pct: 75,  r: 21,  g: 101, b: 192 },  // Dark blue
+        { pct: 100, r: 13,  g: 71,  b: 161 }   // Very dark blue (wet)
+      ];
+
+      // Find the two colors to interpolate between
+      let lower = colors[0];
+      let upper = colors[colors.length - 1];
+
+      for (let i = 0; i < colors.length - 1; i++) {
+        if (pct >= colors[i].pct && pct <= colors[i + 1].pct) {
+          lower = colors[i];
+          upper = colors[i + 1];
+          break;
+        }
+      }
+
+      // Interpolate
+      const range = upper.pct - lower.pct;
+      const pctInRange = range === 0 ? 0 : (pct - lower.pct) / range;
+
+      const r = Math.round(lower.r + (upper.r - lower.r) * pctInRange);
+      const g = Math.round(lower.g + (upper.g - lower.g) * pctInRange);
+      const b = Math.round(lower.b + (upper.b - lower.b) * pctInRange);
+
+      return `rgb(${r},${g},${b})`;
+    }
+
+    // Get text color based on background
+    function getTextColor(pct) {
+      return pct > 40 ? '#ffffff' : '#1a237e';
+    }
+
+    // Update all data
     function updateData() {
       fetch('/data')
         .then(response => response.json())
         .then(data => {
-          // Update Status
+          // Update Status Bar
           const statusDiv = document.getElementById('status');
-          statusDiv.innerHTML = 'System State: ' + data.state + ' | IP: ' + data.ip;
-          if (data.state === 'IRRIGATING') { statusDiv.style.background = '#2ecc71'; statusDiv.style.color = '#fff'; }
-          else if (data.state === 'SYSTEM_FAULT') { statusDiv.style.background = '#e74c3c'; statusDiv.style.color = '#fff'; }
-          else { statusDiv.style.background = '#ecf0f1'; statusDiv.style.color = '#2c3e50'; }
+          let statusText = '🔄 State: ' + data.state;
+          if (data.ip) statusText += ' | 🌐 IP: ' + data.ip;
+          statusDiv.innerHTML = statusText;
+          statusDiv.className = '';
+          if (data.state === 'IRRIGATING') statusDiv.classList.add('irrigating');
+          else if (data.state === 'SYSTEM_FAULT') statusDiv.classList.add('fault');
 
-          // Update Sensor Grid
+          // Sort sensors for 3x3 grid display (top-left to bottom-right, but visually top row first)
+          // We want: [6,7,8] top row, [3,4,5] middle, [0,1,2] bottom
+          const sortedSensors = [...data.sensors].sort((a, b) => {
+            if (b.y !== a.y) return b.y - a.y;  // Higher Y first (top)
+            return a.x - b.x;  // Lower X first (left)
+          });
+
+          // Update Live Sensor Grid
           const grid = document.getElementById('grid');
           grid.innerHTML = '';
-          data.sensors.forEach(s => {
+          sortedSensors.forEach(s => {
             const div = document.createElement('div');
             div.className = 'sensor';
-            div.innerHTML = `<span class="sensor-title">S-${s.channel} (${s.x},${s.y})</span><br>
-                           <span class="sensor-val">${s.pct}%</span><br>
-                           <span class="sensor-pct">(${s.val})</span>`;
+            if (s.isDry) div.classList.add('dry');
+            else if (s.pct > 70) div.classList.add('wet');
 
-            if (s.isDry) { div.style.borderColor = '#e74c3c'; div.style.background = '#fbe9e7'; }
-            else if (s.pct > 80) { div.style.borderColor = '#2980b9'; div.style.background = '#eaf5fb'; }
-            else { div.style.borderColor = '#bdc3c7'; div.style.background = '#ecf0f1'; }
+            div.innerHTML = `
+              <div class="sensor-title">Sensor ${s.channel} (${s.x},${s.y})</div>
+              <div class="sensor-val">${s.pct}%</div>
+              <div class="sensor-raw">Raw: ${s.val}</div>
+            `;
             grid.appendChild(div);
           });
+
+          // Update Moisture Heatmap
+          const heatmap = document.getElementById('heatmap');
+          heatmap.innerHTML = '';
+          sortedSensors.forEach(s => {
+            const cell = document.createElement('div');
+            cell.className = 'heatmap-cell';
+            cell.style.background = getMoistureColor(s.pct);
+            cell.style.color = getTextColor(s.pct);
+            cell.innerHTML = `
+              <div class="pct">${s.pct}%</div>
+              <div class="label">S${s.channel}</div>
+            `;
+            heatmap.appendChild(cell);
+          });
+
+          // Update Stats
+          const pcts = data.sensors.map(s => s.pct);
+          const avg = Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length);
+          const min = Math.min(...pcts);
+          const max = Math.max(...pcts);
+
+          document.getElementById('stat-avg').textContent = avg + '%';
+          document.getElementById('stat-min').textContent = min + '%';
+          document.getElementById('stat-max').textContent = max + '%';
         })
-        .catch(error => console.error('Error fetching data:', error));
+        .catch(error => {
+          console.error('Error:', error);
+          document.getElementById('status').innerHTML = '❌ Connection Error';
+        });
     }
 
+    // Send command to ESP32
     function sendCommand(cmd) {
       fetch('/serial?cmd=' + cmd)
         .then(response => response.text())
-        .then(text => {
-          document.getElementById('serial-output').textContent = text;
-        })
-        .catch(error => {
-          document.getElementById('serial-output').textContent = 'Error: ' + error;
-        });
+        .then(text => alert(text))
+        .catch(error => alert('Error: ' + error));
     }
 
-    // Initial display and auto-update
-    showPage('report');
-    updateData();
-    setInterval(updateData, 3000);
-
-    // Handle File Upload Form Submission
+    // Handle file upload
     document.getElementById('upload-form').addEventListener('submit', function(e) {
-        e.preventDefault();
-        const fileInput = document.getElementById('configFile');
-        const uploadStatus = document.getElementById('upload-status');
+      e.preventDefault();
+      const fileInput = document.getElementById('configFile');
+      const status = document.getElementById('upload-status');
 
-        if (fileInput.files.length === 0) {
-            uploadStatus.textContent = 'Please select a file.';
-            return;
-        }
+      if (fileInput.files.length === 0) {
+        status.innerHTML = '<span style="color:#f44336;">Please select a file.</span>';
+        return;
+      }
 
-        uploadStatus.textContent = 'Uploading...';
+      const file = fileInput.files[0];
+      if (file.name !== 'config.json') {
+        status.innerHTML = '<span style="color:#f44336;">File must be named config.json</span>';
+        return;
+      }
 
-        const file = fileInput.files[0];
-        if (file.name !== "config.json") {
-             uploadStatus.textContent = 'Error: File must be named config.json';
-             return;
-        }
+      status.innerHTML = '<span style="color:#ff9800;">Uploading...</span>';
 
-        const formData = new FormData();
-        formData.append('config', file);
+      const formData = new FormData();
+      formData.append('config', file);
 
-        fetch('/upload', {
-            method: 'POST',
-            body: formData
-        })
+      fetch('/upload', { method: 'POST', body: formData })
         .then(response => response.text())
         .then(text => {
-            uploadStatus.textContent = text;
+          status.innerHTML = '<span style="color:#4caf50;">✅ ' + text + '</span>';
         })
         .catch(error => {
-            uploadStatus.textContent = 'Upload Failed: ' + error;
+          status.innerHTML = '<span style="color:#f44336;">❌ Upload failed: ' + error + '</span>';
         });
     });
+
+    // Initial load and auto-refresh
+    updateData();
+    setInterval(updateData, 3000);
   </script>
 </body>
 </html>
@@ -810,7 +1023,8 @@ void handleMonitoring() {
     monTick = millis();
     Serial.println("--- (Monitoring) ---");
     readAllSensors(); // This now calls printSensorReadings()
-    
+    analyzeFieldGradient();  // Analyze moisture topology gradient
+
     // --- Leak Detection Logic ---
     for (int i = 0; i < NUM_SENSORS; i++) {
       if (sensorMap[i].moisturePercentage >= LEAK_THRESHOLD_PERCENT) {
@@ -928,14 +1142,14 @@ void handleIrrigating() {
     if (lastMoistureSum != 0) {
       if (currentMoistureSum >= lastMoistureSum) { 
         irrigationFailureCheckCount++;
-        Serial.print("!!! WARNING: Soil moisture is not decreasing! (Check ");
+        Serial.print("!!! WARNING: Soil is not getting wetter! (Check ");
         Serial.print(irrigationFailureCheckCount);
         Serial.println(")");
-        
+
         if (irrigationFailureCheckCount >= 3) {
           Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
           Serial.println("!!! ALERT: IRRIGATION FAILURE (NO MOISTURE CHANGE) !!!");
-          Serial.println("Pump is ON but moisture is not increasing. Check pump/well.");
+          Serial.println("Pump is ON but soil is not getting wetter. Check pump/well.");
           Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
           
           forcePumpOff();
@@ -1075,8 +1289,7 @@ void printSensorReadings() {
  */
 void readAllSensors() {
   for (int i = 0; i < NUM_SENSORS; i++) {
-    int channel = sensorMap[i].channel;
-    int value = readSensor(channel);
+    int value = readSensor(i);  // i == sensorMap[i].channel by design
     sensorMap[i].moistureValue = value;
     sensorMap[i].isDry = (value > DRY_THRESHOLD);
     sensorMap[i].moisturePercentage = convertToPercentage(value);
@@ -1126,39 +1339,90 @@ bool checkIfAllSensorsWet() {
 /**
  * @brief Reads a single sensor from Mux, checking for simulation first.
  */
-int readSensor(int channel) {
-  // Bounds check
-  if (channel < 0 || channel >= NUM_SENSORS) {
-    Serial.print("ERROR: Invalid channel request: ");
-    Serial.println(channel);
+int readSensor(int index) {
+  if (index < 0 || index >= NUM_SENSORS) {
+    Serial.print("ERROR: Invalid sensor index: ");
+    Serial.println(index);
     return CALIBRATION_DRY;
   }
-  
-  if (simulatedValues[channel] != -1) {
-    int simValue = simulatedValues[channel];
-    simulatedValues[channel] = -1;
-    
-    Serial.print("...Using simulated value ");
+
+  if (simulatedValues[index] != -1) {
+    int simValue = simulatedValues[index];
+    simulatedValues[index] = -1;
+    Serial.print("SIM: Using value ");
     Serial.print(simValue);
     Serial.print(" for Sensor ");
-    Serial.println(channel);
-    
+    Serial.println(index);
     return simValue;
   }
-  
-  // Select hardware channel
-  digitalWrite(MUX_S0_PIN, bitRead(channel, 0));
-  digitalWrite(MUX_S1_PIN, bitRead(channel, 1));
-  digitalWrite(MUX_S2_PIN, bitRead(channel, 2));
-  delayMicroseconds(MUX_SETTLE_TIME_US); // Settle the multiplexer
-  
-  // Take ADC_SAMPLES for de-noising
+
   long acc = 0;
-  for (int i = 0; i < ADC_SAMPLES; i++) {
-    acc += analogRead(MUX_COMMON_PIN);
-    delay(ADC_SAMPLE_DELAY_MS);
+
+  if (index < 8) {
+    // SENSORS 0-7: Read via Multiplexer
+    digitalWrite(MUX_S0_PIN, bitRead(index, 0));
+    digitalWrite(MUX_S1_PIN, bitRead(index, 1));
+    digitalWrite(MUX_S2_PIN, bitRead(index, 2));
+    delayMicroseconds(MUX_SETTLE_TIME_US);
+
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+      acc += analogRead(MUX_COMMON_PIN);
+      delay(ADC_SAMPLE_DELAY_MS);
+    }
   }
+  else {
+    // SENSOR 8: Read Direct Pin (GPIO 35)
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+      acc += analogRead(SENSOR_9_PIN);
+      delay(ADC_SAMPLE_DELAY_MS);
+    }
+  }
+
   return (int)(acc / (long)ADC_SAMPLES);
+}
+
+/**
+ * @brief Analyzes moisture gradient across the field
+ * Detects patterns like gravity drainage or blockages
+ */
+void analyzeFieldGradient() {
+  // For 3x3 grid: Compare top row vs bottom row
+  // Bottom row: sensors 0, 1, 2 (Y=10)
+  // Top row: sensors 6, 7, 8 (Y=30)
+
+  float bottomAvg = 0, topAvg = 0;
+  int bottomCount = 0, topCount = 0;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (sensorMap[i].y == 10) {  // Bottom row
+      bottomAvg += sensorMap[i].moisturePercentage;
+      bottomCount++;
+    }
+    else if (sensorMap[i].y == 30) {  // Top row
+      topAvg += sensorMap[i].moisturePercentage;
+      topCount++;
+    }
+  }
+
+  if (bottomCount > 0) bottomAvg /= bottomCount;
+  if (topCount > 0) topAvg /= topCount;
+
+  float gradient = topAvg - bottomAvg;
+
+  Serial.print("GRADIENT: Top=");
+  Serial.print(topAvg, 1);
+  Serial.print("% Bottom=");
+  Serial.print(bottomAvg, 1);
+  Serial.print("% Diff=");
+  Serial.print(gradient, 1);
+  Serial.println("%");
+
+  if (gradient > 30) {
+    Serial.println("GRADIENT WARNING: Top wet, bottom dry - possible blockage");
+  }
+  else if (gradient < -30) {
+    Serial.println("GRADIENT INFO: Normal gravity drainage pattern");
+  }
 }
 
 /**
@@ -1170,54 +1434,87 @@ bool isFieldWet() {
 }
 
 /**
-* @brief Advanced clustering check (BFS algorithm).
-* Checks for a "connected component" of 3+ dry sensors.
-*/
-bool checkForCluster() {
-  bool dry[NUM_SENSORS];
-  for (int i = 0; i < NUM_SENSORS; i++) dry[i] = sensorMap[i].isDry;
-
-  // Quick exit
-  int dryTotal = 0;
-  for (int i = 0; i < NUM_SENSORS; i++) if (dry[i]) dryTotal++;
-  if (dryTotal < MIN_DRY_SENSORS_TO_TRIGGER) {
-    lastClusterSize = 0; // No cluster
-    return false;
-  }
-
+ * @brief Robust BFS Cluster Detection with Topology Analysis
+ * Returns true if a connected group of dry sensors >= minClusterSize is found.
+ * Uses formal queue-based BFS for accurate cluster detection.
+ */
+bool checkMoistureTopology(int minClusterSize) {
   bool visited[NUM_SENSORS] = {false};
 
-  for (int start = 0; start < NUM_SENSORS; start++) {
-    if (!dry[start] || visited[start]) continue;
+  for (int startNode = 0; startNode < NUM_SENSORS; startNode++) {
+    if (sensorMap[startNode].isDry && !visited[startNode]) {
 
-    // BFS/DFS to count connected dry nodes
-    int queue[NUM_SENSORS]; int qh = 0, qt = 0;
-    queue[qt++] = start; visited[start] = true;
-    int compSize = 0;
+      // --- BFS SEARCH ---
+      int queue[NUM_SENSORS];
+      int head = 0;
+      int tail = 0;
+      int currentClusterSize = 0;
+      int clusterMembers[NUM_SENSORS];
+      int clusterMemberCount = 0;
 
-    while (qh < qt) {
-      int u = queue[qh++]; compSize++;
+      visited[startNode] = true;
+      queue[tail++] = startNode;
+      currentClusterSize++;
+      clusterMembers[clusterMemberCount++] = startNode;
 
-      for (int v = 0; v < NUM_SENSORS; v++) {
-        if (u == v || !dry[v] || visited[v]) continue;
-        long dx = sensorMap[u].x - sensorMap[v].x;
-        long dy = sensorMap[u].y - sensorMap[v].y;
-        long d2 = dx*dx + dy*dy;
-        if (d2 <= NEIGHBOR_DISTANCE_THRESHOLD_SQUARED) {
-          visited[v] = true;
-          queue[qt++] = v;
+      while (head < tail) {
+        int u = queue[head++];
+
+        for (int v = 0; v < NUM_SENSORS; v++) {
+          if (u == v || visited[v] || !sensorMap[v].isDry) continue;
+
+          long dx = sensorMap[u].x - sensorMap[v].x;
+          long dy = sensorMap[u].y - sensorMap[v].y;
+          long distSq = (dx * dx) + (dy * dy);
+
+          if (distSq <= NEIGHBOR_DISTANCE_THRESHOLD_SQUARED) {
+            visited[v] = true;
+            queue[tail++] = v;
+            currentClusterSize++;
+            clusterMembers[clusterMemberCount++] = v;
+          }
         }
       }
-    }
 
-    if (compSize >= MIN_DRY_SENSORS_TO_TRIGGER) {
-      lastClusterSize = compSize; // Log cluster size
-      return true;
+      // Log cluster info based on size
+      if (currentClusterSize == 1) {
+        Serial.print("TOPOLOGY: Isolated dry sensor S");
+        Serial.print(startNode);
+        Serial.print(" (Ch");
+        Serial.print(sensorMap[startNode].channel);
+        Serial.println(") - not enough for irrigation");
+      }
+      else if (currentClusterSize >= 2) {
+        Serial.print("TOPOLOGY: Cluster size ");
+        Serial.print(currentClusterSize);
+        Serial.print(" at sensors: ");
+        for (int i = 0; i < clusterMemberCount; i++) {
+          Serial.print(clusterMembers[i]);
+          if (i < clusterMemberCount - 1) Serial.print(",");
+        }
+        Serial.println();
+      }
+
+      if (currentClusterSize >= minClusterSize) {
+        Serial.print("TOPOLOGY ALERT: Dry cluster of ");
+        Serial.print(currentClusterSize);
+        Serial.println(" - triggering irrigation!");
+        lastClusterSize = currentClusterSize;
+        return true;
+      }
     }
   }
-  
-  lastClusterSize = 0; // No clusters were large enough
+
+  lastClusterSize = 0;
   return false;
+}
+
+/**
+ * @brief Wrapper for topology-based cluster detection
+ * Maintains backward compatibility with existing code
+ */
+bool checkForCluster() {
+  return checkMoistureTopology(MIN_DRY_SENSORS_TO_TRIGGER);
 }
 
 /**
@@ -1463,37 +1760,64 @@ void resetMonthlyMetrics() {
  * @brief Runs a self-test to check channel mapping.
  */
 void runPowerOnSelfTest() {
-  Serial.println("--- Power-On Self-Test: Channel Map ---");
-  Serial.println("Verifying Sensor Map (X,Y) against Mux Channels...");
+  Serial.println("===========================================");
+  Serial.println("--- Power-On Self-Test: Sensor Config ---");
+  Serial.println("===========================================");
+
+  Serial.println("Pin Configuration:");
+  Serial.print("  Relay: GPIO "); Serial.println(RELAY_PIN);
+  Serial.print("  MUX S0: GPIO "); Serial.println(MUX_S0_PIN);
+  Serial.print("  MUX S1: GPIO "); Serial.println(MUX_S1_PIN);
+  Serial.print("  MUX S2: GPIO "); Serial.println(MUX_S2_PIN);
+  Serial.print("  MUX Common: GPIO "); Serial.println(MUX_COMMON_PIN);
+  Serial.print("  Direct ADC: GPIO "); Serial.println(SENSOR_9_PIN);
+  Serial.println();
+
+  Serial.println("Sensor Mapping:");
   for (int ch = 0; ch < NUM_SENSORS; ch++) {
-    Serial.print("Mux Channel "); Serial.print(ch);
+    // Different label for MUX vs Direct sensors
+    if (ch < 8) {
+      Serial.print("  MUX Ch"); Serial.print(ch);
+    } else {
+      Serial.print("  Direct GPIO 35");
+    }
+
     bool found = false;
-    for (int i = 0; i<NUM_SENSORS; i++) {
+    for (int i = 0; i < NUM_SENSORS; i++) {
       if (sensorMap[i].channel == ch) {
-        Serial.print(" -> Mapped to (X,Y): (");
-        Serial.print(sensorMap[i].x); Serial.print(",");
-        Serial.print(sensorMap[i].y); Serial.println(")");
+        Serial.print(" -> S"); Serial.print(i);
+        Serial.print(" ("); Serial.print(sensorMap[i].x);
+        Serial.print(","); Serial.print(sensorMap[i].y);
+        Serial.println(")");
         found = true;
         break;
       }
     }
-    if (!found) Serial.println(" -> ERROR: Unmapped channel!");
+    if (!found) Serial.println(" -> ERROR: Unmapped!");
   }
-  Serial.println("--- Self-Test Complete ---");
+
+  Serial.println("===========================================");
 }
 
 /**
  * @brief Initializes the sensor (X,Y) map.
  */
 void initializeSensorMap() {
-  // NOTE: Channel 0 is assigned last (sensorMap[7])
-  // This is intentional and matches the 2x4 grid
-  sensorMap[0] = {10, 10, 1, false, 0, 0}; 
-  sensorMap[1] = {10, 20, 2, false, 0, 0}; 
-  sensorMap[2] = {10, 30, 3, false, 0, 0};
-  sensorMap[3] = {10, 40, 4, false, 0, 0};
-  sensorMap[4] = {20, 10, 5, false, 0, 0};
-  sensorMap[5] = {20, 20, 6, false, 0, 0};
-  sensorMap[6] = {20, 30, 7, false, 0, 0}; 
-  sensorMap[7] = {20, 40, 0, false, 0, 0};
+  // 3x3 Grid Layout (matches physical field layout):
+  //
+  //   Row 3 (Y=30): [6] [7] [8]   <- Top of field
+  //   Row 2 (Y=20): [3] [4] [5]   <- Middle
+  //   Row 1 (Y=10): [0] [1] [2]   <- Bottom of field
+  //
+  //                 X=10 X=20 X=30
+
+  sensorMap[0] = {10, 10, 0, false, 0, 0};  // Bottom-left
+  sensorMap[1] = {20, 10, 1, false, 0, 0};  // Bottom-center
+  sensorMap[2] = {30, 10, 2, false, 0, 0};  // Bottom-right
+  sensorMap[3] = {10, 20, 3, false, 0, 0};  // Middle-left
+  sensorMap[4] = {20, 20, 4, false, 0, 0};  // Middle-center
+  sensorMap[5] = {30, 20, 5, false, 0, 0};  // Middle-right
+  sensorMap[6] = {10, 30, 6, false, 0, 0};  // Top-left
+  sensorMap[7] = {20, 30, 7, false, 0, 0};  // Top-center
+  sensorMap[8] = {30, 30, 8, false, 0, 0};  // Top-right (NEW 9th sensor)
 }
