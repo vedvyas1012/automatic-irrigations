@@ -27,10 +27,15 @@
 
 // --- 1. PIN DEFINITIONS (ESP32 GPIO) ---
 const int RELAY_PIN = 23;
-const int MUX_COMMON_PIN = 34;
+
+// Multiplexer Control Pins (Output Capable GPIOs)
 const int MUX_S0_PIN = 19;
 const int MUX_S1_PIN = 18;
-const int MUX_S2_PIN = 5;
+const int MUX_S2_PIN = 21;  // Changed from GPIO 5 to GPIO 21
+
+// Analog Reading Pins (ADC1 - Safe for WiFi)
+const int MUX_COMMON_PIN = 34;  // Reads sensors 0-7 via multiplexer
+const int SENSOR_9_PIN = 35;    // Reads sensor 8 directly
 
 // --- Time conversion constants ---
 const unsigned long MILLIS_PER_SECOND = 1000UL;
@@ -139,6 +144,7 @@ int simulatedValues[NUM_SENSORS];
 
 // File upload variable (global handle for chunked uploads)
 File uploadFile;
+bool uploadSuccess = false;  // Track upload status
 
 // --- Forward Declarations ---
 void forcePumpOff();
@@ -151,6 +157,9 @@ void handleData();
 void handleSerialCommand();
 void handleUpload();
 void handleFileUpload();
+
+// Forward declaration for HTML page stored in PROGMEM
+extern const char HTML_PAGE[] PROGMEM;
 
 // --- 5. THE setup() FUNCTION ---
 void setup() {
@@ -175,6 +184,7 @@ void setup() {
   // Set ADC attenuation for better 0-3.3V range
   #ifdef ARDUINO_ARCH_ESP32
     analogSetPinAttenuation(MUX_COMMON_PIN, ADC_11db); // ~3.3V full scale
+    analogSetPinAttenuation(SENSOR_9_PIN, ADC_11db);   // ~3.3V full scale for sensor 8
   #endif
 
   initializeSensorMap();
@@ -360,14 +370,15 @@ void loadConfigFromSPIFFS() {
     return;
   }
 
-  // Allocate buffer and read file
-  std::unique_ptr<char[]> buf(new char[size]);
+  // Allocate buffer and read file (with null terminator)
+  std::unique_ptr<char[]> buf(new char[size + 1]);
   configFile.readBytes(buf.get(), size);
+  buf[size] = '\0';  // Null-terminate the buffer
   configFile.close();
 
-  // Parse JSON
+  // Parse JSON (pass length for extra safety)
   StaticJsonDocument<4096> doc;
-  DeserializationError error = deserializeJson(doc, buf.get());
+  DeserializationError error = deserializeJson(doc, buf.get(), size);
 
   if (error) {
     Serial.print("ERROR: Failed to parse config.json: ");
@@ -525,9 +536,14 @@ void handleSerialCommand() {
  * @brief Handles the completion of a file upload.
  */
 void handleUpload() {
-  server.send(200, "text/plain", "Config uploaded successfully! ESP32 will reload config...");
-  delay(100); // Let response send
-  loadConfigFromSPIFFS(); // Reload the new config
+  if (uploadSuccess) {
+    server.send(200, "text/plain", "Config uploaded successfully! Reloading...");
+    delay(100);
+    loadConfigFromSPIFFS();
+  } else {
+    server.send(400, "text/plain", "Upload failed! File must be named config.json");
+  }
+  uploadSuccess = false;  // Reset for next upload
 }
 
 /**
@@ -537,6 +553,7 @@ void handleFileUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    uploadSuccess = false;  // Reset flag at start
     Serial.print("Receiving file: ");
     Serial.println(upload.filename);
 
@@ -563,6 +580,7 @@ void handleFileUpload() {
     // Close file and report completion
     if (uploadFile) {
       uploadFile.close();
+      uploadSuccess = true;  // Mark success only if file handle was valid
       Serial.print("Upload complete: ");
       Serial.print(upload.totalSize);
       Serial.println(" bytes");
@@ -657,9 +675,9 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
   <div class="container">
     <!-- Navigation -->
     <div class="nav">
-      <button class="nav-btn active" onclick="showPage('status')">📊 Live Status</button>
-      <button class="nav-btn heatmap" onclick="showPage('heatmap')">🗺️ Moisture Map</button>
-      <button class="nav-btn upload" onclick="showPage('upload')">⚙️ Upload Config</button>
+      <button class="nav-btn active" onclick="showPage(this, 'status')">📊 Live Status</button>
+      <button class="nav-btn heatmap" onclick="showPage(this, 'heatmap')">🗺️ Moisture Map</button>
+      <button class="nav-btn upload" onclick="showPage(this, 'upload')">⚙️ Upload Config</button>
     </div>
 
     <!-- Status Bar -->
@@ -741,11 +759,11 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
   <script>
     // Page Navigation
-    function showPage(pageId) {
+    function showPage(btn, pageId) {
       document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
       document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
       document.getElementById('page-' + pageId).classList.add('active');
-      event.target.classList.add('active');
+      btn.classList.add('active');
     }
 
     // Get moisture color (blue gradient)
@@ -1124,14 +1142,14 @@ void handleIrrigating() {
     if (lastMoistureSum != 0) {
       if (currentMoistureSum >= lastMoistureSum) { 
         irrigationFailureCheckCount++;
-        Serial.print("!!! WARNING: Soil moisture is not decreasing! (Check ");
+        Serial.print("!!! WARNING: Soil is not getting wetter! (Check ");
         Serial.print(irrigationFailureCheckCount);
         Serial.println(")");
-        
+
         if (irrigationFailureCheckCount >= 3) {
           Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
           Serial.println("!!! ALERT: IRRIGATION FAILURE (NO MOISTURE CHANGE) !!!");
-          Serial.println("Pump is ON but moisture is not increasing. Check pump/well.");
+          Serial.println("Pump is ON but soil is not getting wetter. Check pump/well.");
           Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
           
           forcePumpOff();
@@ -1271,8 +1289,7 @@ void printSensorReadings() {
  */
 void readAllSensors() {
   for (int i = 0; i < NUM_SENSORS; i++) {
-    int channel = sensorMap[i].channel;
-    int value = readSensor(channel);
+    int value = readSensor(i);  // i == sensorMap[i].channel by design
     sensorMap[i].moistureValue = value;
     sensorMap[i].isDry = (value > DRY_THRESHOLD);
     sensorMap[i].moisturePercentage = convertToPercentage(value);
@@ -1322,38 +1339,45 @@ bool checkIfAllSensorsWet() {
 /**
  * @brief Reads a single sensor from Mux, checking for simulation first.
  */
-int readSensor(int channel) {
-  // Bounds check
-  if (channel < 0 || channel >= NUM_SENSORS) {
-    Serial.print("ERROR: Invalid channel request: ");
-    Serial.println(channel);
+int readSensor(int index) {
+  if (index < 0 || index >= NUM_SENSORS) {
+    Serial.print("ERROR: Invalid sensor index: ");
+    Serial.println(index);
     return CALIBRATION_DRY;
   }
-  
-  if (simulatedValues[channel] != -1) {
-    int simValue = simulatedValues[channel];
-    simulatedValues[channel] = -1;
-    
-    Serial.print("...Using simulated value ");
+
+  if (simulatedValues[index] != -1) {
+    int simValue = simulatedValues[index];
+    simulatedValues[index] = -1;
+    Serial.print("SIM: Using value ");
     Serial.print(simValue);
     Serial.print(" for Sensor ");
-    Serial.println(channel);
-    
+    Serial.println(index);
     return simValue;
   }
-  
-  // Select hardware channel
-  digitalWrite(MUX_S0_PIN, bitRead(channel, 0));
-  digitalWrite(MUX_S1_PIN, bitRead(channel, 1));
-  digitalWrite(MUX_S2_PIN, bitRead(channel, 2));
-  delayMicroseconds(MUX_SETTLE_TIME_US); // Settle the multiplexer
-  
-  // Take ADC_SAMPLES for de-noising
+
   long acc = 0;
-  for (int i = 0; i < ADC_SAMPLES; i++) {
-    acc += analogRead(MUX_COMMON_PIN);
-    delay(ADC_SAMPLE_DELAY_MS);
+
+  if (index < 8) {
+    // SENSORS 0-7: Read via Multiplexer
+    digitalWrite(MUX_S0_PIN, bitRead(index, 0));
+    digitalWrite(MUX_S1_PIN, bitRead(index, 1));
+    digitalWrite(MUX_S2_PIN, bitRead(index, 2));
+    delayMicroseconds(MUX_SETTLE_TIME_US);
+
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+      acc += analogRead(MUX_COMMON_PIN);
+      delay(ADC_SAMPLE_DELAY_MS);
+    }
   }
+  else {
+    // SENSOR 8: Read Direct Pin (GPIO 35)
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+      acc += analogRead(SENSOR_9_PIN);
+      delay(ADC_SAMPLE_DELAY_MS);
+    }
+  }
+
   return (int)(acc / (long)ADC_SAMPLES);
 }
 
@@ -1452,7 +1476,15 @@ bool checkMoistureTopology(int minClusterSize) {
         }
       }
 
-      if (currentClusterSize >= 2) {
+      // Log cluster info based on size
+      if (currentClusterSize == 1) {
+        Serial.print("TOPOLOGY: Isolated dry sensor S");
+        Serial.print(startNode);
+        Serial.print(" (Ch");
+        Serial.print(sensorMap[startNode].channel);
+        Serial.println(") - not enough for irrigation");
+      }
+      else if (currentClusterSize >= 2) {
         Serial.print("TOPOLOGY: Cluster size ");
         Serial.print(currentClusterSize);
         Serial.print(" at sensors: ");
@@ -1470,14 +1502,6 @@ bool checkMoistureTopology(int minClusterSize) {
         lastClusterSize = currentClusterSize;
         return true;
       }
-    }
-  }
-
-  // Log isolated dry sensors
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    if (sensorMap[i].isDry && !visited[i]) {
-      Serial.print("TOPOLOGY: Isolated dry sensor Ch");
-      Serial.println(sensorMap[i].channel);
     }
   }
 
@@ -1736,23 +1760,43 @@ void resetMonthlyMetrics() {
  * @brief Runs a self-test to check channel mapping.
  */
 void runPowerOnSelfTest() {
-  Serial.println("--- Power-On Self-Test: Channel Map ---");
-  Serial.println("Verifying Sensor Map (X,Y) against Mux Channels...");
+  Serial.println("===========================================");
+  Serial.println("--- Power-On Self-Test: Sensor Config ---");
+  Serial.println("===========================================");
+
+  Serial.println("Pin Configuration:");
+  Serial.print("  Relay: GPIO "); Serial.println(RELAY_PIN);
+  Serial.print("  MUX S0: GPIO "); Serial.println(MUX_S0_PIN);
+  Serial.print("  MUX S1: GPIO "); Serial.println(MUX_S1_PIN);
+  Serial.print("  MUX S2: GPIO "); Serial.println(MUX_S2_PIN);
+  Serial.print("  MUX Common: GPIO "); Serial.println(MUX_COMMON_PIN);
+  Serial.print("  Direct ADC: GPIO "); Serial.println(SENSOR_9_PIN);
+  Serial.println();
+
+  Serial.println("Sensor Mapping:");
   for (int ch = 0; ch < NUM_SENSORS; ch++) {
-    Serial.print("Mux Channel "); Serial.print(ch);
+    // Different label for MUX vs Direct sensors
+    if (ch < 8) {
+      Serial.print("  MUX Ch"); Serial.print(ch);
+    } else {
+      Serial.print("  Direct GPIO 35");
+    }
+
     bool found = false;
-    for (int i = 0; i<NUM_SENSORS; i++) {
+    for (int i = 0; i < NUM_SENSORS; i++) {
       if (sensorMap[i].channel == ch) {
-        Serial.print(" -> Mapped to (X,Y): (");
-        Serial.print(sensorMap[i].x); Serial.print(",");
-        Serial.print(sensorMap[i].y); Serial.println(")");
+        Serial.print(" -> S"); Serial.print(i);
+        Serial.print(" ("); Serial.print(sensorMap[i].x);
+        Serial.print(","); Serial.print(sensorMap[i].y);
+        Serial.println(")");
         found = true;
         break;
       }
     }
-    if (!found) Serial.println(" -> ERROR: Unmapped channel!");
+    if (!found) Serial.println(" -> ERROR: Unmapped!");
   }
-  Serial.println("--- Self-Test Complete ---");
+
+  Serial.println("===========================================");
 }
 
 /**
