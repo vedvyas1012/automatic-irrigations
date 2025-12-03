@@ -1012,6 +1012,17 @@ void checkSerialCommands() {
     else if (input == "FORCE_IRRIGATE_CHECK") { irrTick = 0; Serial.println("SIM: Forcing next IRRIGATING check."); }
     // NOTE: Setting wateringStopTime = 0 can intentionally trip "unexpectedly dry/wet" alerts.
     else if (input == "FORCE_WAIT_SKIP") { wateringStopTime = 0; Serial.println("SIM: Forcing WAITING skip."); }
+    // Print IP address command
+    else if (input == "IP") {
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("WiFi connected! IP address: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("Access dashboard at: http://");
+        Serial.println(WiFi.localIP());
+      } else {
+        Serial.println("WiFi not connected. No IP address available.");
+      }
+    }
   }
 }
 
