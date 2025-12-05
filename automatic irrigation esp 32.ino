@@ -519,12 +519,17 @@ void handleSerialCommand() {
     Serial.print("Web command received: ");
     Serial.println(cmd);
 
-    // Pass the command to our existing serial handler
+    // Generate reports and send to web
     if (cmd == "REPORT") {
-      logMoistureAndMetricsReport();
-      logCsvDailySummary();
+      String dailyReport = generateDailyReport();
+      server.send(200, "text/plain", dailyReport);
+      return;
     }
-    if (cmd == "MONTHLY_REPORT") logMonthlyReport();
+    if (cmd == "MONTHLY_REPORT") {
+      String monthlyReport = generateMonthlyReport();
+      server.send(200, "text/plain", monthlyReport);
+      return;
+    }
 
     server.send(200, "text/plain", "Command executed. Check Serial Monitor for output.");
   } else {
@@ -878,7 +883,33 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     function sendCommand(cmd) {
       fetch('/serial?cmd=' + cmd)
         .then(response => response.text())
-        .then(text => alert(text))
+        .then(text => {
+          // Display report in a modal-like alert with proper formatting
+          if (cmd === 'REPORT' || cmd === 'MONTHLY_REPORT') {
+            // Create a modal div for better display
+            const modal = document.createElement('div');
+            modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:1000;display:flex;align-items:center;justify-content:center;';
+
+            const content = document.createElement('div');
+            content.style.cssText = 'background:white;padding:20px;border-radius:10px;max-width:90%;max-height:90%;overflow:auto;';
+
+            const pre = document.createElement('pre');
+            pre.style.cssText = 'font-family:monospace;font-size:12px;white-space:pre-wrap;margin:0;';
+            pre.textContent = text;
+
+            const closeBtn = document.createElement('button');
+            closeBtn.textContent = 'Close';
+            closeBtn.style.cssText = 'margin-top:15px;padding:10px 20px;background:#007bff;color:white;border:none;border-radius:5px;cursor:pointer;';
+            closeBtn.onclick = () => document.body.removeChild(modal);
+
+            content.appendChild(pre);
+            content.appendChild(closeBtn);
+            modal.appendChild(content);
+            document.body.appendChild(modal);
+          } else {
+            alert(text);
+          }
+        })
         .catch(error => alert('Error: ' + error));
     }
 
@@ -1531,93 +1562,146 @@ bool checkForCluster() {
 /**
  * @brief Prints a full daily report AND adds totals to the monthly counters.
  */
-void logMoistureAndMetricsReport() {
-  Serial.println("=========================================");
-  Serial.println("--- 24-HOUR DAILY REPORT ---");
-  Serial.println("=========================================");
+/**
+ * @brief Generates daily report as a String (for web or serial)
+ */
+String generateDailyReport() {
+  String report = "";
+  report += "=========================================\n";
+  report += "--- 24-HOUR DAILY REPORT ---\n";
+  report += "=========================================\n\n";
 
   // 1. Per-Sensor Moisture Report
-  Serial.println("--- Per-Sensor Daily Averages ---");
+  report += "--- Per-Sensor Daily Averages ---\n";
   for (int i = 0; i < NUM_SENSORS; i++) {
     float avgMoisture = 0.0;
     if (totalMoistureReadingsPerSensor[i] > 0) {
       avgMoisture = (float)totalMoistureSumPerSensor[i] / (float)totalMoistureReadingsPerSensor[i];
     }
-    Serial.print("Sensor (Ch ");
-    Serial.print(sensorMap[i].channel);
-    Serial.print(" @ ");
-    Serial.print(sensorMap[i].x);
-    Serial.print(",");
-    Serial.print(sensorMap[i].y);
-    Serial.print("): ");
-    Serial.print(avgMoisture);
-    Serial.println("% avg");
+    report += "Sensor (Ch " + String(sensorMap[i].channel) + " @ " +
+              String(sensorMap[i].x) + "," + String(sensorMap[i].y) + "): " +
+              String(avgMoisture, 1) + "% avg\n";
   }
 
   // 2. Irrigation Metrics
-  Serial.println("--- Irrigation Metrics (Totals & Avgs) ---");
-  Serial.print("Irrigation Cycles Today: ");
-  Serial.println(irrigationFrequencyCount);
+  report += "\n--- Irrigation Metrics (Totals & Avgs) ---\n";
+  report += "Irrigation Cycles Today: " + String(irrigationFrequencyCount) + "\n";
 
   float avgFieldMoisture = 0.0;
   if(totalFieldMoistureReadings > 0) {
     avgFieldMoisture = (float)totalFieldMoistureSum / (float)totalFieldMoistureReadings;
   }
-  
+
   float avgWateringDuration = 0.0;
   float avgTimeToWet = 0.0;
   float avgTimeToDry = 0.0;
-  
+
   if (irrigationFrequencyCount > 0) {
     avgWateringDuration = totalWateringDurationMin / (float)irrigationFrequencyCount;
     avgTimeToWet = totalTimeToWetMin / (float)irrigationFrequencyCount;
     avgTimeToDry = totalTimeToDryHours / (float)irrigationFrequencyCount;
   }
 
-  Serial.print("Avg. Field Moisture: ");
-  Serial.print(avgFieldMoisture);
-  Serial.println("%");
-  
-  Serial.print("Total Water Used (Est.): ");
-  Serial.print(totalLitersUsed);
-  Serial.println(" Liters");
+  report += "Avg. Field Moisture: " + String(avgFieldMoisture, 1) + "%\n";
+  report += "Total Water Used (Est.): " + String(totalLitersUsed, 1) + " Liters\n";
+  report += "Avg. Watering Duration: " + String(avgWateringDuration, 1) + " minutes\n";
+  report += "Avg. Time to Wet (Wetting Rate): " + String(avgTimeToWet, 1) + " minutes\n";
+  report += "Avg. Time to Dry (Drying Rate): " + String(avgTimeToDry, 1) + " hours\n";
 
-  Serial.print("Avg. Watering Duration: ");
-  Serial.print(avgWateringDuration);
-  Serial.println(" minutes");
-
-  Serial.print("Avg. Time to Wet (Wetting Rate): ");
-  Serial.print(avgTimeToWet);
-  Serial.println(" minutes");
-
-  Serial.print("Avg. Time to Dry (Drying Rate): ");
-  Serial.print(avgTimeToDry);
-  Serial.println(" hours");
-  
   // 3. Soil Health Report Card
-  Serial.println("--- Soil Health Report Card ---");
+  report += "\n--- Soil Health Report Card ---\n";
   if (irrigationFrequencyCount > 0) {
     if (avgTimeToWet > HEALTHY_WETTING_TIME_MIN) {
-      Serial.print("DIAGNOSIS: POOR INFILTRATION. Soil took ");
-      Serial.print(avgTimeToWet);
-      Serial.println(" mins to get wet (check for soil compaction).");
+      report += "DIAGNOSIS: POOR INFILTRATION. Soil took " + String(avgTimeToWet, 1) +
+                " mins to get wet (check for soil compaction).\n";
     } else {
-      Serial.println("DIAGNOSIS: Good soil infiltration.");
+      report += "DIAGNOSIS: Good soil infiltration.\n";
     }
-    
+
     if (avgTimeToDry > HEALTHY_DRYING_TIME_HOURS) {
-      Serial.print("DIAGNOSIS: POOR DRAINAGE. Soil took ");
-      Serial.print(avgTimeToDry);
-      Serial.println(" hours to dry (check for waterlogging).");
+      report += "DIAGNOSIS: POOR DRAINAGE. Soil took " + String(avgTimeToDry, 1) +
+                " hours to dry (check for waterlogging).\n";
     } else {
-      Serial.println("DIAGNOSIS: Good soil drainage.");
+      report += "DIAGNOSIS: Good soil drainage.\n";
     }
   } else {
-    Serial.println("DIAGNOSIS: No irrigation cycles, cannot assess soil health.");
+    report += "DIAGNOSIS: No irrigation cycles, cannot assess soil health.\n";
   }
-  Serial.println("=========================================");
-  
-  // 4. Add daily totals to monthly totals & SAVE to flash
+  report += "=========================================\n";
+
+  return report;
+}
+
+/**
+ * @brief Generates monthly report as a String (for web or serial)
+ */
+String generateMonthlyReport() {
+  String report = "";
+  report += "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+  report += "--- 30-DAY MONTHLY REPORT ---\n";
+  report += "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+
+  report += "Total Irrigation Cycles: " + String(monthlyIrrigationFrequency) + "\n";
+  report += "Total Water Used (Est.): " + String(monthlyTotalLitersUsed, 1) + " Liters\n";
+  report += "Total Pump Run Time: " + String(monthlyTotalWateringMin, 1) + " minutes\n";
+
+  report += "\n--- Monthly Averages (Avg. of Dailies) ---\n";
+
+  float finalAvgFieldMoisture = 0;
+  float finalAvgTimeToWet = 0;
+  float finalAvgTimeToDry = 0;
+
+  if (monthlyReportCount > 0) {
+    finalAvgFieldMoisture = monthlyAvgFieldMoisture / (float)monthlyReportCount;
+    finalAvgTimeToWet = monthlyAvgTimeToWet / (float)monthlyReportCount;
+    finalAvgTimeToDry = monthlyAvgTimeToDry / (float)monthlyReportCount;
+  }
+
+  report += "Avg. Field Moisture: " + String(finalAvgFieldMoisture, 1) + "%\n";
+  report += "Avg. Time to Wet: " + String(finalAvgTimeToWet, 1) + " minutes\n";
+  report += "Avg. Time to Dry: " + String(finalAvgTimeToDry, 1) + " hours\n";
+
+  report += "\n--- Monthly Soil Health Diagnosis ---\n";
+  if (monthlyReportCount > 0) {
+    if (finalAvgTimeToWet > HEALTHY_WETTING_TIME_MIN) {
+      report += "DIAGNOSIS: POOR INFILTRATION (Consistent).\n";
+    } else {
+      report += "DIAGNOSIS: Good soil infiltration (Consistent).\n";
+    }
+    if (finalAvgTimeToDry > HEALTHY_DRYING_TIME_HOURS) {
+      report += "DIAGNOSIS: POOR DRAINAGE (Consistent).\n";
+    } else {
+      report += "DIAGNOSIS: Good soil drainage (Consistent).\n";
+    }
+  } else {
+    report += "DIAGNOSIS: No data to assess.\n";
+  }
+
+  report += "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+
+  return report;
+}
+
+void logMoistureAndMetricsReport() {
+  // Generate and print report to Serial
+  String report = generateDailyReport();
+  Serial.print(report);
+
+  // Calculate values for monthly accumulation
+  float avgFieldMoisture = 0.0;
+  if(totalFieldMoistureReadings > 0) {
+    avgFieldMoisture = (float)totalFieldMoistureSum / (float)totalFieldMoistureReadings;
+  }
+
+  float avgTimeToWet = 0.0;
+  float avgTimeToDry = 0.0;
+
+  if (irrigationFrequencyCount > 0) {
+    avgTimeToWet = totalTimeToWetMin / (float)irrigationFrequencyCount;
+    avgTimeToDry = totalTimeToDryHours / (float)irrigationFrequencyCount;
+  }
+
+  // Add daily totals to monthly totals & SAVE to flash
   monthlyIrrigationFrequency += irrigationFrequencyCount;
   monthlyTotalLitersUsed += totalLitersUsed;
   monthlyTotalWateringMin += totalWateringDurationMin;
@@ -1663,62 +1747,9 @@ void logCsvDailySummary() {
  * @brief Prints a full 30-Day "Monthly" Report
  */
 void logMonthlyReport() {
-  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-  Serial.println("--- 30-DAY MONTHLY REPORT ---");
-  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-
-  Serial.print("Total Irrigation Cycles: ");
-  Serial.println(monthlyIrrigationFrequency);
-  
-  Serial.print("Total Water Used (Est.): ");
-  Serial.print(monthlyTotalLitersUsed);
-  Serial.println(" Liters");
-
-  Serial.print("Total Pump Run Time: ");
-  Serial.print(monthlyTotalWateringMin);
-  Serial.println(" minutes");
-
-  Serial.println("--- Monthly Averages (Avg. of Dailies) ---");
-
-  float finalAvgFieldMoisture = 0;
-  float finalAvgTimeToWet = 0;
-  float finalAvgTimeToDry = 0;
-
-  if (monthlyReportCount > 0) {
-    finalAvgFieldMoisture = monthlyAvgFieldMoisture / (float)monthlyReportCount;
-    finalAvgTimeToWet = monthlyAvgTimeToWet / (float)monthlyReportCount;
-    finalAvgTimeToDry = monthlyAvgTimeToDry / (float)monthlyReportCount;
-  }
-
-  Serial.print("Avg. Field Moisture: ");
-  Serial.print(finalAvgFieldMoisture);
-  Serial.println("%");
-
-  Serial.print("Avg. Time to Wet: ");
-  Serial.print(finalAvgTimeToWet);
-  Serial.println(" minutes");
-
-  Serial.print("Avg. Time to Dry: ");
-  Serial.print(finalAvgTimeToDry);
-  Serial.println(" hours");
-  
-  Serial.println("--- Monthly Soil Health Diagnosis ---");
-  if (monthlyReportCount > 0) {
-    if (finalAvgTimeToWet > HEALTHY_WETTING_TIME_MIN) {
-      Serial.println("DIAGNOSIS: POOR INFILTRATION (Consistent).");
-    } else {
-      Serial.println("DIAGNOSIS: Good soil infiltration (Consistent).");
-    }
-    if (finalAvgTimeToDry > HEALTHY_DRYING_TIME_HOURS) {
-      Serial.println("DIAGNOSIS: POOR DRAINAGE (Consistent).");
-    } else {
-      Serial.println("DIAGNOSIS: Good soil drainage (Consistent).");
-    }
-  } else {
-    Serial.println("DIAGNOSIS: No data to assess.");
-  }
-  
-  Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+  // Generate and print report to Serial
+  String report = generateMonthlyReport();
+  Serial.print(report);
 }
 
 /**
